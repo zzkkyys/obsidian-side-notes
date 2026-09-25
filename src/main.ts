@@ -1,4 +1,4 @@
-import { MarkdownView, Menu, Notice, Plugin, TFile, type EventRef, type TAbstractFile } from "obsidian";
+import { MarkdownView, Menu, Notice, Plugin, TFile, type EventRef } from "obsidian";
 import { applyCardStyle } from "./card-style";
 import { EditorHighlights, sourceRange } from "./editor";
 import { buildCard, type CardHooks } from "./card";
@@ -72,6 +72,27 @@ export default class GlossPlugin extends Plugin {
       callback: () => void this.cmdCreate(),
     });
     this.addCommand({
+      id: "open-annotation-at-cursor",
+      name: "打开光标处批注",
+      editorCallback: (editor, view) => {
+        if (!(view instanceof MarkdownView)) return;
+        const path = view.file?.path;
+        if (!path) return;
+        const store = this.storage.docCacheFor(path);
+        const text = editor.getValue();
+        const offset = editor.posToOffset(editor.getCursor());
+        const entry = store?.entries.find(e => {
+          if (e.anchor.kind !== "md") return false;
+          const range = sourceRange(text, e.anchor);
+          return range && offset >= range.from && offset < range.to;
+        });
+        if (!store || !entry) { new Notice("Gloss：请先把光标放到批注高亮内"); return; }
+        const mark = Array.from(view.contentEl.querySelectorAll<HTMLElement>(".gloss-hl"))
+          .find(el => el.dataset.glossId === entry.note.id);
+        GlossBubble.show(this, entry, this.storage.typeOf(entry.note.typeId), mark ?? view.contentEl, store);
+      },
+    });
+    this.addCommand({
       id: "toggle-layout",
       name: "切换布局（页边 ⇄ 气泡）",
       callback: () => {
@@ -98,17 +119,11 @@ export default class GlossPlugin extends Plugin {
     this.registerMarkdownPostProcessor((_el, ctx) => {
       if (ctx.sourcePath) this.schedule(ctx.sourcePath);
     });
-    // 注：markdown-preview-rendered / editor-mode / file-rename / file-delete 在运行时均存在，
-    // 但此 d.ts 版本未给出类型重载，通过通用重载注册
-    this.registerEvent(this.wsEvent("markdown-preview-rendered", (...d) => {
-      const path = d[1] as string | undefined;
-      if (path) this.schedule(path);
-    }));
+    // 阅读视图由 postprocessor 驱动；编辑器高亮由 CodeMirror ViewPlugin 管理。
     this.registerEvent(this.app.workspace.on("file-open", () => {
       this.scheduleAll();
       this.pdf?.scan();
     }));
-    this.registerEvent(this.wsEvent("editor-mode", () => this.scheduleAll()));
     this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleAll()));
 
     // ---- 文件变动 ----
@@ -123,9 +138,10 @@ export default class GlossPlugin extends Plugin {
       void this.renameDocData(oldPath, f.path);
       this.scheduleAll();
     }));
-    this.registerEvent(this.wsEvent("file-delete", (...d) => {
-      const f = d[0] as TAbstractFile | null;
-      if (f?.path.startsWith(".gloss/")) this.storage.invalidate();
+    this.registerEvent(this.app.vault.on("delete", (f) => {
+      if (this.createPop?.docPath === f.path) this.closeCreatePopover();
+      if (GlossBubble.docPath === f.path) GlossBubble.close();
+      this.scheduleAll();
     }));
     this.registerEvent(this.app.vault.on("modify", (f) => {
       if (f.path.startsWith(".gloss/")) this.storage.invalidate();

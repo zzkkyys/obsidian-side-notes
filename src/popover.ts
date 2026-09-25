@@ -139,7 +139,8 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   positionPopover(pop, opts.rect);
   const onKey = (event: KeyboardEvent) => {
     if (event.key !== "Escape" || document.querySelector(".gloss-image-viewer")) return;
-    event.preventDefault(); event.stopPropagation(); dismiss();
+    event.preventDefault(); event.stopPropagation();
+    if (!ta.value.trim() && attachments.length === 0 && !composer.hasPending() && !save.disabled) dismiss();
   };
   const onOutside = (event: MouseEvent) => {
     if (pop.contains(event.target as Node) || (event.target as Element).closest?.(".modal-container")) return;

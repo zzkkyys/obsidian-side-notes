@@ -19,13 +19,17 @@ export class TypeManagerModal extends Modal {
       cls: "gloss-tm-hint",
       text: "点击名称 / Emoji / 色块就地修改；拖动 ⋮⋮（或按 ↑↓）排序；改动即时生效于全库。",
     });
+    if (!this.plugin.storage.canEditTypes) {
+      contentEl.createDiv({ text: "类型文件不可读，暂时无法编辑。请修复 .gloss/types.json 后重新打开此面板。" });
+      return;
+    }
     const list = contentEl.createDiv({ cls: "gloss-tm-list" });
 
     const persist = (refresh = true) => {
       this.plugin.storage.saveTypes();
       // 默认类型被删时回退到第一个
       if (!this.plugin.storage.types.some((t) => t.id === this.plugin.settings.defaultTypeId)) {
-        this.plugin.settings.defaultTypeId = this.plugin.storage.types[0]?.id ?? "key";
+        this.plugin.settings.defaultTypeId = this.plugin.storage.types[0]?.id ?? "general";
         void this.plugin.saveSettings();
       }
       if (refresh) this.plugin.refreshAll();

@@ -47,8 +47,10 @@ export function mdViewMode(view: MarkdownView): "source" | "livepreview" | "prev
   }
   if (m === "preview") return "preview";
   if (m === "livepreview") return "livepreview";
-  const state = view.getState();
-  if (m === "source" && typeof state.source === "boolean") return state.source ? "source" : "livepreview";
+  try {
+    const state = view.getState?.();
+    if (m === "source" && typeof state?.source === "boolean") return state.source ? "source" : "livepreview";
+  } catch { /* 旧版本或正在销毁的视图：继续尝试 DOM 模式类。 */ }
   // 模式类（当前 Obsidian 版本按实际模式设置）：最直接的判断依据，
   // 无需从正文格式猜。is-source-mode 优先——显式源码模式不能被正文启发式误判为 LP
   const host = view.contentEl;

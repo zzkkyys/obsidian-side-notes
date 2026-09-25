@@ -206,3 +206,14 @@ test('empty types list remains valid, malicious color is not accepted or overwri
   assert.equal(bad.disk.get('.gloss/types.json'), malicious);
   assert.equal(bad.storage.types.some(t => t.id === 'x'), false);
 });
+
+
+test('corrupt type data disables editing and attempted saves preserve disk', async () => {
+  const f = fixture({ '.gloss/types.json': '{broken' });
+  await f.storage.loadTypes();
+  assert.equal(f.storage.canEditTypes, false);
+  f.storage.types[0].name = 'unsaved edit';
+  f.storage.saveTypes();
+  await f.storage.flushAll();
+  assert.equal(f.disk.get('.gloss/types.json'), '{broken');
+});

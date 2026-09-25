@@ -124,7 +124,21 @@ export class GlossStorage {
     return this.types.find((t) => t.id === id) ?? this.types.find(t => t.id === currentTypeId(id)) ?? GHOST_TYPE;
   }
 
+  get canEditTypes(): boolean { return !this.typesFailed; }
+
+  private lastSaveWarning = 0;
+  private warnSave(message: string): void {
+    const now = Date.now();
+    if (now - this.lastSaveWarning < 3000) return;
+    this.lastSaveWarning = now;
+    new Notice(message);
+  }
+
   saveTypes(): void {
+    if (this.typesFailed) {
+      this.warnSave("Gloss：类型文件不可读，改动未保存。请先修复 .gloss/types.json");
+      return;
+    }
     this.typesDirty = true;
     if (this.saveTypesTimer) clearTimeout(this.saveTypesTimer);
     this.saveTypesTimer = setTimeout(() => { this.saveTypesTimer = null; void this.writeTypesNow().catch(e => console.error("[Gloss] types save failed", e)); }, 250);
@@ -370,7 +384,7 @@ export class GlossStorage {
   saveStore(store: GlossDocStore): boolean {
     const state = this.storeState.get(store);
     if (!state || !state.store || state.failed) {
-      new Notice("Gloss：批注已更新或暂不可写，请重新打开卡片后重试");
+      this.warnSave("Gloss：批注已更新或暂不可写，请重新打开卡片后重试");
       return false;
     }
     this.armSave(state);
