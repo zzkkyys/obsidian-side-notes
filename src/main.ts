@@ -1,0 +1,729 @@
+import { MarkdownView, Menu, Notice, Plugin, TFile, type EventRef, type TAbstractFile } from "obsidian";
+import { applyCardStyle } from "./card-style";
+import { EditorHighlights, sourceRange } from "./editor";
+import { buildCard, type CardHooks } from "./card";
+import { exportDocAnnotations } from "./export";
+import { buildMarginLayout, getSurface, type MarginLayout } from "./layout";
+import { GENERIC_BLOCK_EDITOR, GENERIC_BLOCK_PREVIEW, unwrapAll, blockPlainText, locateAnchor, selectionToMdAnchor, wrapRangeInBlock } from "./anchor";
+import { GlossBubble, SelectionPill, openCreatePopover, dismissCreatePopover } from "./popover";
+import { PdfGloss } from "./pdf";
+import { GlossSettingTab } from "./settings";
+import { GlossStorage } from "./storage";
+import { TypeManagerModal } from "./typemanager";
+import {
+  defaultSettings,
+  currentTypeId,
+  type Anchor,
+  type GlossAttachment,
+  type GlossDocStore,
+  type GlossEntry,
+  type GlossSettings,
+  type GlossType,
+  type MdAnchor,
+} from "./types";
+import { debounce, mdViewMode, sourceToRenderedApprox, uuid } from "./util";
+
+export default class GlossPlugin extends Plugin {
+  settings: GlossSettings = defaultSettings();
+  storage = new GlossStorage(this);
+
+  private editorHighlights = new EditorHighlights(this);
+  private pill = new SelectionPill();
+  private layoutOverride: "margin" | "bubble" | null = null;
+  private renderTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private renderState = new WeakMap<HTMLElement, { sig: string; at: number }>();
+  private readingObservers = new Map<HTMLElement, MutationObserver>();
+  private layoutMap = new Map<HTMLElement, MarginLayout>();
+  private versionCounter = new Map<string, number>();
+  private popoverOpen = false;
+  /** 打开中的新建批注浮层（文档重命名时要关掉：它闭包持有旧路径） */
+  private createPop: { el: HTMLElement; docPath: string } | null = null;
+  private pdf: PdfGloss | null = null;
+  private statusEl: HTMLElement | null = null;
+  private fileStats = new Map<string, { visible: number; orphan: number; fail?: string }>();
+  private lastErrAt = 0;
+  /** 渲染竞态令牌：同一 contentEl 上最新的渲染生效，旧的在 await 后作废 */
+  private renderSeq = new WeakMap<HTMLElement, number>();
+  /** 插件存活标志：卸载后一切异步回调立即退出 */
+  private alive = true;
+
+  get isAlive(): boolean { return this.alive; }
+
+  // ================= 生命周期 =================
+
+  async onload(): Promise<void> {
+    await this.loadSettings();
+    this.storage.plugin = this;
+    await this.storage.loadTypes();
+
+    this.registerEditorExtension(this.editorHighlights.extension());
+    this.addSettingTab(new GlossSettingTab(this.app, this));
+    this.addRibbonIcon("message-square", "Gloss：新建批注", () => void this.cmdCreate());
+
+    // 状态栏诊断：右下角显示当前打开文档的高亮/失效锚点数量
+    this.statusEl = this.addStatusBarItem();
+    this.statusEl.setText("Gloss 0");
+    this.statusEl.title = "Gloss：当前文档批注渲染状态";
+
+    this.addCommand({
+      id: "new-annotation",
+      name: "新建批注（当前选区）",
+      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "m" }],
+      callback: () => void this.cmdCreate(),
+    });
+    this.addCommand({
+      id: "toggle-layout",
+      name: "切换布局（页边 ⇄ 气泡）",
+      callback: () => {
+        this.layoutOverride = this.layoutOverride === null ? "bubble" : this.layoutOverride === "bubble" ? "margin" : null;
+        new Notice(
+          this.layoutOverride === null ? "Gloss 布局：自动" :
+          this.layoutOverride === "margin" ? "Gloss 布局：页边双栏" : "Gloss 布局：气泡",
+        );
+        this.refreshAll();
+      },
+    });
+    this.addCommand({
+      id: "manage-types",
+      name: "管理批注类型",
+      callback: () => new TypeManagerModal(this.app, this).open(),
+    });
+    this.addCommand({
+      id: "export-annotations",
+      name: "导出批注（当前文档）",
+      callback: () => void this.cmdExport(),
+    });
+
+    // ---- 渲染触发 ----
+    this.registerMarkdownPostProcessor((_el, ctx) => {
+      if (ctx.sourcePath) this.schedule(ctx.sourcePath);
+    });
+    // 注：markdown-preview-rendered / editor-mode / file-rename / file-delete 在运行时均存在，
+    // 但此 d.ts 版本未给出类型重载，通过通用重载注册
+    this.registerEvent(this.wsEvent("markdown-preview-rendered", (...d) => {
+      const path = d[1] as string | undefined;
+      if (path) this.schedule(path);
+    }));
+    this.registerEvent(this.app.workspace.on("file-open", () => {
+      this.scheduleAll();
+      this.pdf?.scan();
+    }));
+    this.registerEvent(this.wsEvent("editor-mode", () => this.scheduleAll()));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleAll()));
+
+    // ---- 文件变动 ----
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      if (!(f instanceof TFile) || !oldPath || !/\.(md|pdf)$/i.test(oldPath)) return;
+      if (oldPath.startsWith(".gloss/")) { this.storage.invalidate(); return; }
+      // 关掉持有旧路径的浮层：迁移提交后旧路径是全新身份，
+      // 新建浮层从旧路径保存会写到旧路径的幽灵文件，气泡里的内存改动会静默丢失；
+      // 关掉后用户在重命名后的文档上重新打开
+      if (this.createPop?.docPath === oldPath) this.closeCreatePopover();
+      if (GlossBubble.docPath === oldPath) GlossBubble.close();
+      void this.renameDocData(oldPath, f.path);
+      this.scheduleAll();
+    }));
+    this.registerEvent(this.wsEvent("file-delete", (...d) => {
+      const f = d[0] as TAbstractFile | null;
+      if (f?.path.startsWith(".gloss/")) this.storage.invalidate();
+    }));
+    this.registerEvent(this.app.vault.on("modify", (f) => {
+      if (f.path.startsWith(".gloss/")) this.storage.invalidate();
+    }));
+
+    // Hidden annotation files require adapter reads; polling does not depend on undocumented events.
+    const checkExternal = () => { void this.storage.checkExternalChanges().then(changed => {
+      if (changed && this.alive) this.refreshAll();
+    }); };
+    this.registerInterval(window.setInterval(checkExternal, 5000));
+    this.registerDomEvent(window, "focus", checkExternal);
+
+    // ---- 视口 / 选区 ----
+    const onResize = debounce(() => this.scheduleAll(), 200);
+    this.registerDomEvent(window, "resize", onResize);
+
+    this.registerDomEvent(document, "selectionchange", () => this.updatePill());
+    this.registerDomEvent(window, "scroll", () => this.pill.hide(), true);
+    this.registerDomEvent(this.pill.ensureEl(), "mousedown", (event) => event.preventDefault());
+    this.registerDomEvent(this.pill.ensureEl(), "click", () => void this.cmdCreate());
+
+    // ---- 右键菜单（编辑器：源码/实时预览；阅读视图走选区浮泡） ----
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu: Menu, editor) => {
+      try {
+        if (editor.getSelection().trim()) {
+          menu.addItem((i) => {
+            i.setTitle("新建批注").setIcon("message-square")
+              .onClick(() => void this.cmdCreate());
+          });
+        }
+      } catch { /* ignore */ }
+    }));
+
+    // ---- 粗糙边缘高亮的全局 SVG 滤镜（只作用于高亮背景层） ----
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "0");
+    svg.setAttribute("height", "0");
+    svg.setAttribute("aria-hidden", "true");
+    svg.style.position = "absolute";
+    svg.innerHTML =
+      '<filter id="gloss-rough" x="-5%" y="-25%" width="110%" height="150%">' +
+      '<feTurbulence type="fractalNoise" baseFrequency="0.02 0.08" numOctaves="3" seed="7" result="noise"/>' +
+      '<feDisplacementMap in="SourceGraphic" in2="noise" scale="7" xChannelSelector="R" yChannelSelector="G"/>' +
+      "</filter>";
+    document.body.appendChild(svg);
+    this.register(() => svg.remove());
+
+    // ---- PDF 场景 ----
+    this.pdf = new PdfGloss(this);
+    this.pdf.start();
+
+    this.app.workspace.onLayoutReady(() => this.scheduleAll());
+  }
+
+  async onunload(): Promise<void> {
+    this.alive = false;
+    for (const t of this.renderTimers.values()) clearTimeout(t);
+    this.renderTimers.clear();
+    this.pdf?.dispose();
+    for (const observer of this.readingObservers.values()) observer.disconnect();
+    this.readingObservers.clear();
+
+    // 页边布局：卸载卡片 Component → 移除卡片层/解包高亮/清预留 padding，
+    // 并断开 host 上的气泡点击委托（handler 持有 this，不摘除会形成 host→插件的引用链）
+    for (const layout of this.layoutMap.values()) {
+      try {
+        layout.dispose();
+        layout.surface.reset();
+        layout.surface.setGutter(null);
+      } catch { /* ignore */ }
+    }
+    this.layoutMap.clear();
+    // WeakMap 不可枚举：对仍打开的 Markdown 视图按已知 host 选择器摘除委托。
+    // handler 闭包持有 this，不摘除会形成 host→插件引用链（视图 DOM 活得比插件久时）
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const v = leaf.view;
+      if (!(v instanceof MarkdownView)) continue;
+      const ce = v.contentEl;
+      // getSurface 的 host 候选（含回退到 contentEl 本身）
+      for (const h of [
+        ce.querySelector<HTMLElement>(".cm-scroller"),
+        ce.querySelector<HTMLElement>(".markdown-preview-sizer"),
+        ce,
+      ]) {
+        if (!h) continue;
+        const handler = this.bubbleHandlers.get(h);
+        if (handler) {
+          h.removeEventListener("click", handler);
+          this.bubbleHandlers.delete(h);
+          this.bubbleDoc.delete(h);
+        }
+      }
+    }
+    this.pill.dispose();
+    GlossBubble.close();
+    await this.storage.flushAll();
+  }
+
+  /** 注册 d.ts 中缺少类型重载的 workspace 事件（运行时均存在） */
+  private wsEvent(name: string, cb: (...data: unknown[]) => void): EventRef {
+    const ws = this.app.workspace as unknown as {
+      on: (n: string, cb: (...data: unknown[]) => unknown) => EventRef;
+    };
+    return ws.on(name, cb);
+  }
+
+  // ================= 设置 =================
+
+  async loadSettings(): Promise<void> {
+    this.settings = Object.assign(defaultSettings(), await this.loadData());
+    this.settings.defaultTypeId = currentTypeId(this.settings.defaultTypeId);
+    this.settings.marginWidth = Math.max(248, this.settings.marginWidth);
+  }
+
+  async saveSettings(): Promise<void> {
+    await this.saveData(this.settings);
+  }
+
+  /** Style changes do not rebuild cards or disturb drafts/focus. */
+  updateCardStyles(): void {
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(".gloss-card[data-gloss-type], .gloss-bubble[data-gloss-type]"))) {
+      applyCardStyle(el, this.settings, this.storage.typeOf(el.dataset.glossType!));
+    }
+  }
+
+
+  // ================= 渲染管线 =================
+
+  private schedule(path: string): void {
+    if (this.renderTimers.has(path)) clearTimeout(this.renderTimers.get(path)!);
+    this.renderTimers.set(path, setTimeout(() => {
+      this.renderTimers.delete(path);
+      if (!this.alive) return;
+      for (const view of this.mdViewsFor(path)) void this.renderView(view, false);
+    }, 150));
+  }
+
+  private scheduleAll(): void {
+    for (const [host, observer] of this.readingObservers) {
+      if (!host.isConnected) { observer.disconnect(); this.readingObservers.delete(host); }
+    }
+    // 回收已脱离文档的布局（卡片 Component / ResizeObserver）
+    for (const [host, layout] of [...this.layoutMap]) {
+      if (!document.body.contains(host)) {
+        layout.dispose();
+        this.layoutMap.delete(host);
+      }
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file) this.schedule(view.file.path);
+    }
+  }
+
+  refreshDoc(docPath: string): void {
+    for (const view of this.mdViewsFor(docPath)) void this.renderView(view, true);
+    this.pdf?.refresh(docPath);
+  }
+
+  refreshAll(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file) void this.renderView(view, true);
+    }
+    this.pdf?.scan();
+  }
+
+  private mdViewsFor(path: string): MarkdownView[] {
+    const out: MarkdownView[] = [];
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === path) out.push(view);
+    }
+    return out;
+  }
+
+  private mdViewFor(path: string): MarkdownView | null {
+    return this.mdViewsFor(path)[0] ?? null;
+  }
+
+  private contentSig(view: MarkdownView): string {
+    const f = view.file;
+    const mode = mdViewMode(view);
+    // 布局相关参数也进签名：防自激回环只拦"内容没变"的重复渲染，
+    // 改布局/宽度/高亮样式必须能穿透 1.5s 窗口。
+    // 两个宽度都要：window 宽度决定断点（设置项按视口定义）；
+    // 视图实际宽度决定 canMargin——拖分屏分隔线/开侧栏时窗口宽度不变，
+    // 只有纳入视图宽度，后续任何一次渲染才会重估页边可用性
+    return [
+      f?.path,
+      f?.stat?.mtime ?? 0,
+      f?.stat?.size ?? 0,
+      this.versionCounter.get(f?.path ?? "") ?? 0,
+      mode,
+      window.innerWidth,
+      view.contentEl.clientWidth,
+      this.layoutOverride ?? this.settings.layoutMode,
+      this.settings.highlightStyle,
+      this.settings.marginWidth,
+    ].join(":");
+  }
+
+  /** 核心：把一个 MarkdownView 渲染成 Gloss 高亮 + 页边/气泡 */
+  async renderView(view: MarkdownView, force: boolean): Promise<void> {
+    if (!this.alive) return;
+    const file = view.file;
+    if (!file || !view.contentEl.isConnected || view.contentEl.clientWidth === 0) return;
+    // 每次渲染都先作废旧渲染（令牌）
+    const seq = (this.renderSeq.get(view.contentEl) ?? 0) + 1;
+    this.renderSeq.set(view.contentEl, seq);
+
+    const mode = mdViewMode(view);
+    if (mode !== "preview") {
+      const previous = this.layoutMap.get(view.contentEl);
+      previous?.dispose();
+      previous?.surface.reset();
+      previous?.surface.setGutter(null);
+      this.layoutMap.delete(view.contentEl);
+      view.contentEl.querySelectorAll<HTMLElement>(".gloss-gutter-padded").forEach((el) => {
+        el.classList.remove("gloss-gutter-padded");
+        el.style.removeProperty("--gloss-gutter-pad");
+      });
+      const store = await this.storage.loadDoc(file.path);
+      if (!this.alive || view.file?.path !== file.path || this.renderSeq.get(view.contentEl) !== seq) return;
+      this.editorHighlights.refresh(file.path);
+      const entries = store.entries.filter(e => e.anchor.kind === "md");
+      const visible = entries.filter(e => e.anchor.kind === "md" && sourceRange(view.editor.getValue(), e.anchor)).length;
+      this.fileStats.set(file.path, { visible, orphan: entries.length - visible });
+      this.updateStatus();
+      return;
+    }
+
+    // 防自激回环：内容未变 + 无批注变更 + 1.5s 内 → 跳过
+    if (!force) {
+      const sig = this.contentSig(view);
+      const st = this.renderState.get(view.contentEl);
+      if (st && st.sig === sig && Date.now() - st.at < 1500) return;
+    }
+
+    const store = await this.storage.loadDoc(file.path);
+    if (this.renderSeq.get(view.contentEl) !== seq) return; // 期间已有更新渲染，丢弃本次
+    // 身份校验：await 期间视图可能已切走/卸载，旧视图的 contentEl 已被 Obsidian 复用
+    if (!this.alive || view.file?.path !== file.path || !document.body.contains(view.contentEl)) return;
+    // 先卸载旧布局中的 Component，再构造新的 Surface。
+    const prev = this.layoutMap.get(view.contentEl);
+    const reuse = !force && prev?.surface.layer.isConnected && view.contentEl.contains(prev.surface.host)
+      && this.renderState.get(view.contentEl)?.sig === this.contentSig(view)
+      && prev.items.every(it => store.entries.includes(it.entry));
+    if (prev && !reuse) {
+      try { prev.dispose(); } catch { /* ignore */ }
+      this.layoutMap.delete(view.contentEl);
+    }
+    const surface = reuse && prev ? prev.surface : getSurface(view.contentEl, mode);
+    if (!surface) {
+      this.fileStats.set(file.path, { visible: 0, orphan: 0, fail: "surface not found" });
+      this.updateStatus();
+      return;
+    }
+
+    if (!this.readingObservers.has(surface.host)) {
+      const observer = new MutationObserver(records => {
+        const changed = records.some(record => [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].some(node =>
+          node instanceof HTMLElement && !node.classList.contains("gloss-margin-layer") && !node.classList.contains("gloss-connectors")));
+        const path = view.file?.path;
+        if (changed && this.alive && path) {
+          // Virtualized blocks changed, not annotation data: permit reanchoring but retain card DOM.
+          const state = this.renderState.get(view.contentEl);
+          if (state) state.at = 0;
+          this.schedule(path);
+        }
+      });
+      observer.observe(surface.host, { childList: true });
+      this.readingObservers.set(surface.host, observer);
+    }
+
+    try {
+      if (reuse) unwrapAll(surface.host);
+      else surface.reset();
+
+      // 通用块选择器：本 Obsidian 未分配 data-block-id 时的回退搜索范围
+      const genericSel = mode === "preview" ? GENERIC_BLOCK_PREVIEW : GENERIC_BLOCK_EDITOR;
+
+      // 定位 + 包高亮
+      const placed: Array<{ entry: GlossEntry; el: HTMLElement; type: GlossType }> = [];
+      for (const e of store.entries) {
+        if (e.anchor.kind !== "md") continue;
+        const loc = locateAnchor(surface.host, e.anchor, genericSel);
+        if (!loc) continue; // orphan：不渲染，数据保留
+        const t = this.storage.typeOf(e.note.typeId);
+        const n = wrapRangeInBlock(loc.block, loc.start, loc.end, `gloss-hl gloss-hl-${this.settings.highlightStyle}`, e.note.id, t.color);
+        if (n > 0) {
+          const el = surface.host.querySelector<HTMLElement>(`.gloss-hl[data-gloss-id="${e.note.id}"]`);
+          if (el) placed.push({ entry: e, el, type: t });
+        }
+      }
+
+      // 布局判定：手动命令覆盖 > 设置项（auto 时按断点宽度）
+      const forced: "margin" | "bubble" | null = this.layoutOverride
+        ?? (this.settings.layoutMode === "auto" ? null : this.settings.layoutMode);
+      const want: "margin" | "bubble" = forced ?? (window.innerWidth >= this.settings.wideBreakpoint ? "margin" : "bubble");
+      const gutter = Math.max(248, this.settings.marginWidth) + 24;
+      const canMargin = surface.availableWidth() >= surface.readingWidth() + 2 * gutter;
+
+      // 无卡片不留白；即使偏好页边，也不能挤压正文，放不下时回退气泡。
+      if ((placed.length > 0 || reuse) && want === "margin" && canMargin) {
+        surface.setGutter(this.settings.marginWidth);
+        const hooks = (e: GlossEntry): CardHooks => ({
+          // 按 store 对象落盘：重命名后路径变了，但卡片修改的就是这个 store，
+          // 状态对象随之改挂新路径——旧路径的 saveDoc 会漏掉这批修改
+          onChanged: () => {
+            if (!this.storage.saveStore(store)) return;
+            const path = this.storage.currentPath(store) ?? file.path;
+            this.touchVersion(path); this.refreshDoc(path);
+          },
+          onDeleted: () => void this.deleteAnnotation(store, e.note.id),
+        });
+        if (reuse && prev) prev.updateAnchors(placed);
+        else {
+          const layout = buildMarginLayout(this, surface, placed, (e, t) =>
+            buildCard(this, e, t, file.path, hooks(e)));
+          this.layoutMap.set(view.contentEl, layout);
+        }
+      } else {
+        if (reuse && prev) { prev.dispose(); this.layoutMap.delete(view.contentEl); }
+        surface.setGutter(null);
+        this.ensureBubbleClick(surface.host, file.path);
+      }
+
+      const mdEntries = store.entries.filter((e) => e.anchor.kind === "md");
+      // Offscreen blocks are absent from the preview DOM, not evidence of broken anchors.
+      // Validate against the full source before labelling a note orphaned.
+      const source = await this.app.vault.cachedRead(file);
+      if (!this.alive || view.file?.path !== file.path || this.renderSeq.get(view.contentEl) !== seq) return;
+      const unresolved = mdEntries.filter(e => e.anchor.kind === "md" && !sourceRange(source, e.anchor));
+      this.fileStats.set(file.path, { visible: placed.length, orphan: unresolved.length });
+
+    } catch (err) {
+      surface.setGutter(null);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.fileStats.set(file.path, { visible: 0, orphan: 0, fail: msg });
+      if (Date.now() - this.lastErrAt > 5000) {
+        this.lastErrAt = Date.now();
+        new Notice(`Gloss 渲染错误：${msg}`);
+      }
+    }
+
+    this.renderState.set(view.contentEl, { sig: this.contentSig(view), at: Date.now() });
+    this.updateStatus();
+  }
+
+  /** 状态栏：显示当前文档的高亮 / 锚点失效 / 失败原因 */
+  private updateStatus(): void {
+    if (!this.statusEl) return;
+    const view = this.activeMarkdownView();
+    const path = view?.file?.path;
+    let text = "Gloss 0";
+    let title = "Gloss：当前文档批注渲染状态";
+    if (path) {
+      const s = this.fileStats.get(path);
+      if (s) {
+        if (s.fail) {
+          text = "Gloss ⚠";
+          title = `Gloss 渲染失败：${s.fail}`;
+        } else {
+          text = s.orphan > 0 ? `Gloss ${s.visible}✓ ${s.orphan}⚠` : `Gloss ${s.visible}`;
+          title = `Gloss：${path}\n已渲染 ${s.visible} 条高亮，${s.orphan} 条锚点失效（原文可能被编辑/删除）`;
+        }
+      } else {
+        text = "Gloss · 无";
+        title = `Gloss：当前文档尚无批注数据（${path}）`;
+      }
+    }
+    this.statusEl.setText(text);
+    this.statusEl.title = title;
+  }
+
+  /** 气泡模式：高亮点击 → 弹出气泡卡片（每个 host 只委托一次）。
+   *  WeakMap：host 随视图销毁可被 GC（含整个内容 DOM）；
+   *  onunload 时枚举"仍打开的视图"摘除委托，已关视图的 host 交给 GC */
+  private bubbleHandlers = new WeakMap<HTMLElement, (ev: MouseEvent) => void>();
+  /** host → 当前文档路径。host（如 .cm-scroller）会跨文档复用，
+   *  路径必须随每次渲染更新，不能缓存在闭包里 */
+  private bubbleDoc = new WeakMap<HTMLElement, string>();
+
+  private ensureBubbleClick(host: HTMLElement, docPath: string): void {
+    this.bubbleDoc.set(host, docPath);
+    if (this.bubbleHandlers.has(host)) return;
+    const handler = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement;
+      const hl = target.closest(".gloss-hl") as HTMLElement | null;
+      if (!hl || !host.contains(hl)) return;
+      const id = hl.dataset.glossId;
+      const doc = this.bubbleDoc.get(host);
+      if (!id || !doc) return;
+      const store = this.storage.docCacheFor(doc);
+      const entry = store?.entries.find((e) => e.note.id === id);
+      if (!store || !entry) return;
+      GlossBubble.show(this, entry, this.storage.typeOf(entry.note.typeId), hl, store);
+    };
+    host.addEventListener("click", handler);
+    this.bubbleHandlers.set(host, handler);
+  }
+
+  private touchVersion(docPath: string): void {
+    this.versionCounter.set(docPath, (this.versionCounter.get(docPath) ?? 0) + 1);
+  }
+
+  // ================= 选区浮泡 =================
+
+  private activeMarkdownView(): MarkdownView | null {
+    const leaf = this.app.workspace.getMostRecentLeaf();
+    const view = leaf?.view;
+    return view instanceof MarkdownView ? view : null;
+  }
+
+  private updatePill(): void {
+    if (this.popoverOpen || window.getSelection()?.isCollapsed) { this.pill.hide(); return; }
+    const view = this.activeMarkdownView();
+    if (!view || !view.file) { this.pill.hide(); return; }
+    const sel = this.currentSelection();
+    if (sel && view.contentEl.contains(window.getSelection()?.anchorNode ?? document.body)) {
+      this.pill.show(sel.rect);
+    } else {
+      this.pill.hide();
+    }
+  }
+
+  private currentSelection(): { anchor: Anchor; rect: DOMRect } | null {
+    const view = this.activeMarkdownView();
+    if (!view || !view.file) return null;
+    const mode = mdViewMode(view);
+    if (mode !== "preview") return this.editorSelectionAnchor(view);
+    return selectionToMdAnchor(GENERIC_BLOCK_PREVIEW);
+  }
+
+  // ================= 建 / 删批注 =================
+
+  async createAnnotation(
+    docPath: string,
+    anchor: Anchor,
+    typeId: string,
+    content: string,
+    attachments: GlossAttachment[],
+    noteId?: string,
+  ): Promise<void> {
+    const now = Date.now();
+    const entry: GlossEntry = {
+      anchor,
+      note: {
+        id: noteId ?? uuid(),
+        typeId,
+        content,
+        createdAt: now,
+        updatedAt: now,
+        replies: [],
+        attachments,
+      },
+    };
+    await this.storage.addEntry(docPath, entry);
+    await this.storage.flushDoc(docPath);
+    this.touchVersion(docPath);
+    await Promise.all(this.mdViewsFor(docPath).map(view => this.renderView(view, true)));
+    this.pdf?.refresh(docPath);
+    if (!this.settings.defaultTypeId) this.settings.defaultTypeId = typeId;
+  }
+
+  async deleteAnnotation(store: GlossDocStore, noteId: string): Promise<void> {
+    const removed = await this.storage.removeEntry(store, noteId);
+    // 用状态对象的当前路径刷新（重命名后 store.docPath 可能还是旧值）
+    const path = this.storage.currentPath(store) ?? store.docPath;
+    if (removed > 0) {
+      this.touchVersion(path);
+      this.refreshDoc(path);
+    }
+  }
+
+  /** 程序化关闭新建批注浮层（文档重命名时调用） */
+  private closeCreatePopover(): void {
+    const pop = this.createPop;
+    this.createPop = null;
+    if (!pop) return;
+
+    dismissCreatePopover(pop.el);
+
+    this.popoverOpen = false;
+  }
+
+  /** 命令 / 浮泡 / 右键共用入口 */
+  async cmdCreate(): Promise<void> {
+    const view = this.activeMarkdownView();
+    if (!view || !view.file) {
+      new Notice("请先打开一篇 Markdown 文档");
+      return;
+    }
+    const sel = this.currentSelection();
+    if (!sel) {
+      new Notice("请选择同一段内的文字；阅读视图暂不支持跨段落批注");
+      return;
+    }
+    this.popoverOpen = true;
+    this.pill.hide();
+    const el = openCreatePopover(this, {
+      docPath: view.file.path,
+      anchor: sel.anchor,
+      rect: sel.rect,
+      onClosed: () => {
+        this.popoverOpen = false;
+        if (this.createPop?.el === el) this.createPop = null;
+      },
+    });
+    this.createPop = { el, docPath: view.file.path };
+  }
+
+  /** 设置入口：PDF 场景开关 */
+  setPdfEnabled(on: boolean): void {
+    this.pdf?.setPdfEnabled(on);
+  }
+
+  /** PDF 场景的创建入口（pdf.ts 调用） */
+  openPdfCreatePopover(docPath: string, anchor: Anchor, rect: DOMRect): void {
+    this.popoverOpen = true;
+    const el = openCreatePopover(this, {
+      docPath,
+      anchor,
+      rect,
+      onClosed: () => {
+        this.popoverOpen = false;
+        if (this.createPop?.el === el) this.createPop = null;
+      },
+    });
+    this.createPop = { el, docPath };
+  }
+
+  // ================= 源码模式选区 → 锚点 =================
+
+  private editorSelectionAnchor(view: MarkdownView): { anchor: Anchor; rect: DOMRect } | null {
+    const ed = view.editor;
+    const raw = ed.getValue();
+    let from = ed.posToOffset(ed.getCursor("from"));
+    let to = ed.posToOffset(ed.getCursor("to"));
+    if (from === to) {
+      const cursor = ed.getCursor();
+      from = ed.posToOffset({ line: cursor.line, ch: 0 });
+      to = from + ed.getLine(cursor.line).length;
+    }
+    const selected = raw.slice(from, to);
+    if (!selected.trim()) return null;
+    const lineStart = raw.lastIndexOf("\n", Math.max(0, from - 1)) + 1;
+    const endLine = raw.indexOf("\n", to);
+    const lineEnd = endLine < 0 ? raw.length : endLine;
+    const prefix = sourceToRenderedApprox(raw.slice(lineStart, from));
+    const text = sourceToRenderedApprox(selected) || selected;
+    const dom = selectionToMdAnchor(GENERIC_BLOCK_EDITOR);
+    const anchor: MdAnchor = {
+      kind: "md", blockId: "", start: prefix.length, end: prefix.length + text.length, text,
+      blockText: sourceToRenderedApprox(raw.slice(lineStart, lineEnd)),
+      prefix: prefix.slice(-48), suffix: sourceToRenderedApprox(raw.slice(to, lineEnd)).slice(0, 48),
+    };
+    anchor.source = { from, to, text: selected, prefix: raw.slice(Math.max(0, from - 48), from), suffix: raw.slice(to, to + 48) };
+    return { anchor, rect: dom?.rect ?? new DOMRect(window.innerWidth / 2 - 100, window.innerHeight / 2 - 16, 200, 20) };
+  }
+
+  /** 保存后显示刚创建的条目，即使当前没有足够页边空间。 */
+  revealAnnotation(path: string, id: string, rect: DOMRect): void {
+    const view = this.mdViewFor(path);
+    const store = this.storage.docCacheFor(path);
+    const entry = store?.entries.find(e => e.note.id === id);
+    if (!store || !entry) return;
+    const card = view?.contentEl.querySelector<HTMLElement>(`.gloss-card[data-gloss-id="${id}"]`);
+    if (card) { card.scrollIntoView({ block: "nearest" }); return; }
+    const hl = view?.contentEl.querySelector<HTMLElement>(`.gloss-hl[data-gloss-id="${id}"]`);
+    GlossBubble.show(this, entry, this.storage.typeOf(entry.note.typeId), hl ?? rect, store);
+  }
+
+  // ================= 其它命令 =================
+
+  private async cmdExport(): Promise<void> {
+    const view = this.activeMarkdownView();
+    if (!view || !view.file) {
+      new Notice("请先打开要导出的文档");
+      return;
+    }
+    await exportDocAnnotations(this, view.file);
+  }
+
+  async openDoc(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) await this.app.workspace.openLinkText(path, "");
+  }
+
+  // ================= 文件重命名：迁移批注数据 =================
+
+  private async renameDocData(oldPath: string, newPath: string): Promise<void> {
+    // 重命名事务（storage 内 commit/abort）：窗口内旧/新路径的 loadDoc 一律阻塞到
+    // 迁移完成。成功 commit 后文档状态对象整体改挂新路径（缓存/定时器/脏版本/写队列
+    // 随对象迁移，无永久路径别名）；失败 abort 保留原文件的可恢复状态
+    const ok = await this.storage.migrateDoc(oldPath, newPath);
+    if (!ok) new Notice("Gloss：批注数据迁移失败，原文件已保留（可稍后重新命名重试）");
+  }
+
+}

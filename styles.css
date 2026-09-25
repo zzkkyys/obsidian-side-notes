@@ -1,0 +1,758 @@
+/* ============ Gloss — Word 风格页边批注 ============
+ * 设计基调：Obsidian 原生质感为底，6 个批注色是唯一语义强调。
+ * 形状一致性：容器 12 / 卡片 10 / 内部元素 6 / 胶囊 999。
+ * 兼容性：color-mix 需要 Chromium 111+，旧版一律给普通 CSS 回退。
+ */
+
+:root {
+  --gloss-r-container: 12px;
+  --gloss-r-card: 10px;
+  --gloss-r-element: 6px;
+  --gloss-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ---------- 选区上方浮泡 ---------- */
+.gloss-pill {
+  position: fixed;
+  z-index: 900;
+  transform: translateX(-50%);
+  display: none;
+  padding: 4px 12px;
+  background: var(--background-secondary-alt);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  box-shadow: var(--shadow-s);
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.gloss-pill.gloss-show {
+  display: block;
+  animation: gloss-pill-in 0.16s var(--gloss-ease);
+}
+@keyframes gloss-pill-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(5px) scale(0.95); }
+}
+.gloss-pill:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+
+/* ---------- 正文高亮 ---------- */
+.gloss-hl {
+  cursor: pointer;
+  border-radius: 2px;
+  position: relative;
+  isolation: isolate;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* 页边布局预留空间（宽度随 --gloss-gutter-pad 变化，由 layout.ts 设置/移除） */
+.gloss-gutter-padded {
+  padding-left: var(--gloss-gutter-pad, 264px);
+  padding-right: var(--gloss-gutter-pad, 264px);
+}
+
+/* 阅读区扩展到正文两侧的空白，不把页边宽度从可读行宽中扣除。 */
+.markdown-preview-view.is-readable-line-width .markdown-preview-sizer.gloss-gutter-padded {
+  width: 100%;
+  max-width: calc(var(--file-line-width, 700px) + 2 * var(--gloss-gutter-pad));
+  box-sizing: border-box;
+}
+
+/* 下划线模式：彩色虚线 + 浅底 */
+.gloss-hl-underline {
+  background: rgba(59, 130, 246, 0.12);
+  background: color-mix(in srgb, var(--gloss-color, #3b82f6) 14%, transparent);
+  border-bottom: 2px dashed var(--gloss-color, #3b82f6);
+  padding: 0;
+}
+.gloss-hl-underline:hover {
+  background: rgba(59, 130, 246, 0.22);
+  background: color-mix(in srgb, var(--gloss-color, #3b82f6) 26%, transparent);
+}
+
+/* 荧光笔：逐行克隆的手绘轮廓，边缘起伏限制在上下留白内。
+ * 垂直 inline padding 不改变正文行高，水平方向不加 padding，避免改变换行位置。
+ * 第一条背景声明保留给不支持 color-mix() 的旧 Chromium。 */
+.gloss-hl-rough {
+  padding: .12em 0;
+  background: linear-gradient(180deg, transparent 0%, rgba(245,165,36,.25) 4%, rgba(245,165,36,.25) 96%, transparent 100%);
+  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--gloss-color, #f5a524) 27%, transparent) 4%, color-mix(in srgb, var(--gloss-color, #f5a524) 27%, transparent) 96%, transparent 100%);
+}
+/* The SVG only paints the background; glyphs remain sharp and selectable. */
+.gloss-hl-rough[style*="--gloss-marker-image"] {
+  background-image: var(--gloss-marker-image);
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+}
+
+.gloss-hl-rough:hover { outline: 1px solid var(--gloss-color); }
+
+/* ---------- 页边布局层 ---------- */
+.gloss-margin-host {
+  position: relative;
+}
+.gloss-margin-layer {
+  z-index: 5;
+}
+.gloss-connectors {
+  display: block;
+}
+
+/* ---------- 批注卡片 ---------- */
+.gloss-card {
+  --gloss-color: #3b82f6;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--gloss-color);
+  border-radius: var(--gloss-r-card);
+  box-shadow: var(--shadow-s);
+  box-sizing: border-box;
+  padding: 14px;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text-normal);
+  max-height: 420px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  transition: box-shadow 0.15s var(--gloss-ease), transform 0.15s var(--gloss-ease);
+}
+/* 悬浮抬升：给"这张卡可以点"的暗示（气泡内嵌卡片不抬升） */
+.gloss-margin-layer .gloss-card:hover {
+  box-shadow: var(--shadow-m);
+}
+.gloss-card-left { border-left: 1px solid var(--background-modifier-border); border-right: 3px solid var(--gloss-color); }
+
+.gloss-card-head {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.gloss-spacer { flex: 1; }
+
+.gloss-type-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gloss-color);
+  background: var(--background-modifier-hover);
+  background: color-mix(in srgb, var(--gloss-color) 12%, transparent);
+  border-radius: 999px;
+  padding: 2px 9px;
+  cursor: pointer;
+  user-select: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 0.15s var(--gloss-ease);
+}
+.gloss-type-chip:hover {
+  background: var(--background-modifier-border);
+  background: color-mix(in srgb, var(--gloss-color) 22%, transparent);
+}
+.gloss-type-chip.gloss-active {
+  background: var(--gloss-color);
+  color: var(--text-on-accent, #fff);
+}
+
+.gloss-ic {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 4px;
+  border-radius: 5px;
+  opacity: 0.55;
+  transition: opacity 0.12s, background 0.12s, transform 0.1s var(--gloss-ease);
+}
+.gloss-card:hover .gloss-ic, .gloss-bubble .gloss-ic { opacity: 0.9; }
+.gloss-ic:hover { background: var(--background-modifier-hover); opacity: 1; }
+.gloss-ic:active { transform: translateY(1px); }
+.gloss-ic.gloss-active { color: var(--gloss-color); opacity: 1; }
+.gloss-ic.gloss-armed {
+  color: var(--color-red, #e5484d);
+  opacity: 1;
+  background: rgba(229, 72, 77, 0.14);
+  background: color-mix(in srgb, var(--color-red, #e5484d) 15%, transparent);
+}
+
+.gloss-card-body {
+  word-break: break-word;
+  min-height: 14px;
+}
+.gloss-card-body p:first-child { margin-top: 0; }
+.gloss-card-body p:last-child { margin-bottom: 0; }
+.gloss-empty { color: var(--text-faint); font-size: 12px; }
+
+.gloss-edit-ta, .gloss-create-ta, .gloss-reply-ta {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-element);
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.gloss-edit-ta { min-height: 70px; }
+.gloss-create-ta { min-height: 84px; }
+.gloss-edit-row { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+
+.gloss-card button, .gloss-create button, .gloss-bubble button {
+  font-family: inherit;
+}
+.gloss-create-btns, .gloss-tm-foot { display: flex; gap: 6px; }
+.gloss-create-btns { justify-content: flex-end; }
+.gloss-create-btns button, .gloss-tm-foot button, .gloss-reply-send {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-element);
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.1s var(--gloss-ease);
+}
+.gloss-create-btns button:hover, .gloss-tm-foot button:hover, .gloss-reply-send:hover {
+  background: var(--background-modifier-border);
+}
+.gloss-create-btns button:active, .gloss-reply-send:active {
+  transform: translateY(1px);
+}
+.gloss-primary {
+  background: var(--interactive-accent) !important;
+  color: var(--text-on-accent) !important;
+  border-color: transparent !important;
+}
+
+/* 附件 */
+.gloss-card-attach { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.gloss-card-attach.gloss-hidden { display: none; }
+.gloss-attach-row { display: flex; align-items: center; gap: 6px; }
+.gloss-attach-icon { font-size: 13px; }
+.gloss-attach-img {
+  max-width: 100%;
+  max-height: 140px;
+  border-radius: var(--gloss-r-element);
+  display: block;
+}
+.gloss-attach-audio, .gloss-attach-video { width: 100%; max-height: 180px; }
+.gloss-attach-file { color: var(--interactive-accent); word-break: break-all; font-size: 12px; }
+.gloss-attach-rm { margin-left: auto; opacity: 0.4; }
+.gloss-attach-row:hover .gloss-attach-rm { opacity: 0.9; }
+
+.gloss-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.gloss-act {
+  flex: 1;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-element);
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, transform 0.1s var(--gloss-ease);
+}
+.gloss-act:hover { border-color: var(--interactive-accent); color: var(--text-normal); }
+.gloss-act:active { transform: translateY(1px); }
+/* 回复 */
+.gloss-card-replies { margin-top: 12px; }
+.gloss-card-replies > summary { cursor: pointer; color: var(--text-muted); font-size: 12px; padding: 4px 0; }
+.gloss-card-replies[open] > summary { margin-bottom: 8px; }
+.gloss-reply-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; max-height: 120px; overflow-y: auto; }
+.gloss-reply {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  background: var(--background-primary);
+  border-radius: var(--gloss-r-element);
+  padding: 4px 7px;
+}
+.gloss-reply-time { color: var(--text-faint); flex-shrink: 0; font-size: 11px; }
+.gloss-reply-text { color: var(--text-muted); white-space: pre-wrap; word-break: break-word; }
+.gloss-reply-row { display: flex; gap: 6px; align-items: flex-end; }
+.gloss-reply-ta { min-height: 28px; max-height: 80px; flex: 1; }
+.gloss-reply-send { padding: 5px 10px; flex-shrink: 0; }
+
+.gloss-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ---------- 新建批注浮层 ---------- */
+.gloss-create {
+  position: fixed;
+  z-index: 902;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-container);
+  box-shadow: var(--shadow-l);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  animation: gloss-pop-in 0.18s var(--gloss-ease);
+}
+@keyframes gloss-pop-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+}
+.gloss-create-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.gloss-create-title { font-weight: 600; font-size: 14px; }
+.gloss-create-types {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-bottom: 2px;
+}
+.gloss-create-actions { display: flex; gap: 6px; }
+.gloss-create-actions .gloss-act { flex: 1; }
+.gloss-attach-preview { display: flex; flex-direction: column; gap: 4px; }
+.gloss-attach-preview.gloss-hidden { display: none; }
+.gloss-attach-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--background-primary);
+  border-radius: var(--gloss-r-element);
+  padding: 3px 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 气泡（窄屏） ---------- */
+.gloss-bubble {
+  position: fixed;
+  z-index: 903;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-container);
+  box-shadow: var(--shadow-l);
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 560px);
+  overflow: hidden;
+  animation: gloss-pop-in 0.18s var(--gloss-ease);
+}
+.gloss-bubble-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+}
+.gloss-bubble-title { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.gloss-bubble-body { overflow-y: auto; padding: 8px; }
+.gloss-bubble .gloss-card { box-shadow: none; border: none; padding: 0; max-height: none; }
+
+/* ---------- 类型菜单 / 类型管理 ---------- */
+.gloss-type-menu {
+  position: fixed;
+  z-index: 950;
+  min-width: 160px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--gloss-r-card);
+  box-shadow: var(--shadow-l);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  animation: gloss-pop-in 0.14s var(--gloss-ease);
+}
+.gloss-type-row {
+  padding: 6px 10px;
+  font-size: 13px;
+  border-radius: var(--gloss-r-element);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.gloss-type-row:hover { background: var(--background-modifier-hover); }
+
+.gloss-tm-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 6px 0 10px;
+}
+.gloss-tm-list { display: flex; flex-direction: column; gap: 6px; }
+.gloss-tm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--gloss-color);
+  border-radius: var(--gloss-r-card);
+  padding: 6px 8px;
+}
+.gloss-tm-row.gloss-dragging { opacity: 0.4; }
+.gloss-tm-row.gloss-drag-over { border-top: 2px solid var(--interactive-accent); }
+.gloss-tm-grip { cursor: grab; color: var(--text-faint); font-size: 12px; user-select: none; }
+.gloss-tm-emoji {
+  width: 44px;
+  text-align: center;
+  font-size: 15px;
+}
+.gloss-tm-name { flex: 1; min-width: 0; }
+.gloss-tm-row input {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  color: var(--text-normal);
+  padding: 3px 6px;
+  font-size: 13px;
+}
+.gloss-tm-color {
+  width: 34px;
+  height: 26px;
+  padding: 0 !important;
+  border: none !important;
+  background: none !important;
+  cursor: pointer;
+}
+.gloss-tm-nav { display: flex; flex-direction: column; gap: 2px; }
+.gloss-tm-nav button {
+  background: var(--background-modifier-hover);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.1;
+  padding: 1px 5px;
+  cursor: pointer;
+}
+.gloss-tm-nav button:hover { color: var(--text-normal); }
+.gloss-tm-foot { margin-top: 12px; }
+
+/* ---------- PDF 场景 ---------- */
+.gloss-pdf-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.gloss-pdf-hl {
+  position: absolute;
+  border: 1.5px solid var(--gloss-color, #3b82f6);
+  /* 无文字节点，纯色 + opacity 在旧 Chromium 上同样可见 */
+  background: var(--gloss-color, #3b82f6);
+  opacity: 0.16;
+  border-radius: 4px;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: opacity 0.12s var(--gloss-ease);
+}
+@supports (background: color-mix(in srgb, red 50%, transparent)) {
+  .gloss-pdf-hl {
+    opacity: 1;
+    background: color-mix(in srgb, var(--gloss-color, #3b82f6) 16%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--gloss-color, #3b82f6) 25%, transparent);
+  }
+}
+.gloss-pdf-hl:hover { opacity: 0.3; }
+@supports (background: color-mix(in srgb, red 50%, transparent)) {
+  .gloss-pdf-hl:hover {
+    opacity: 1;
+    background: color-mix(in srgb, var(--gloss-color, #3b82f6) 30%, transparent);
+  }
+}
+.gloss-pdf-select {
+  position: absolute;
+  border: 1.5px dashed var(--interactive-accent);
+  background: var(--background-modifier-hover);
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  pointer-events: none;
+}
+
+/* ---------- 可访问性 ---------- */
+.gloss-pill:focus-visible,
+.gloss-card :focus-visible,
+.gloss-create :focus-visible,
+.gloss-bubble :focus-visible,
+.gloss-type-menu :focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+/* 动效总闸：尊重系统"减少动态效果" */
+@media (prefers-reduced-motion: reduce) {
+  .gloss-pill.gloss-show,
+  .gloss-create,
+  .gloss-bubble,
+  .gloss-type-menu {
+    animation: none !important;
+  }
+  .gloss-card, .gloss-ic, .gloss-act,
+  .gloss-type-chip, .gloss-hl-rough::before, .gloss-pdf-hl,
+  .gloss-create-btns button, .gloss-reply-send,
+  .gloss-tm-foot button {
+    transition: none !important;
+  }
+  .gloss-margin-layer .gloss-card:hover,
+  .gloss-ic:active,
+  .gloss-act:active,
+  .gloss-create-btns button:active, .gloss-reply-send:active,
+  .gloss-tm-foot button:active {
+    transform: none !important;
+  }
+}
+
+/* ---------- 移动端微调 ---------- */
+@media (max-width: 600px) {
+  .gloss-card { font-size: 13.5px; }
+  .gloss-bubble-body { padding: 10px; }
+}
+
+/* 卡片内容优先：引用、正文、次要操作使用稳定的层级。 */
+.gloss-card-quote {
+  margin: 4px 0 12px;
+  padding: 4px 0 4px 10px;
+  border-left: 2px solid var(--gloss-color, var(--background-modifier-border));
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+.gloss-card .gloss-type-chip { max-width: calc(100% - 68px); border-radius: 5px; padding: 3px 7px; }
+.gloss-card button.gloss-ic { width: 28px; height: 28px; padding: 6px; flex: 0 0 28px; box-shadow: none; opacity: .8; }
+.gloss-card .gloss-ic svg { width: 15px; height: 15px; }
+.gloss-card-body { padding: 2px 0 8px; }
+.gloss-card-actions { gap: 8px; }
+.gloss-card-actions .gloss-act { min-height: 30px; box-shadow: none; }
+.gloss-card-replies .gloss-reply-ta { min-width: 0; min-height: 36px; }
+.gloss-bubble-body { padding: 14px; }
+.gloss-bubble-head { padding: 10px 14px; }
+.gloss-card:focus-within { border-color: var(--gloss-color); }
+.gloss-create .gloss-create-ta { min-height: 120px; padding: 10px; line-height: 1.6; }
+.gloss-create .gloss-type-chip { flex-shrink: 0; }
+
+.gloss-card button.gloss-act { background: transparent; border: 0; flex: 0 0 auto; padding: 4px 6px; color: var(--text-muted); }
+.gloss-card button.gloss-act:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.gloss-card button.gloss-ic { background: transparent; }
+.gloss-card button.gloss-ic:hover { background: var(--background-modifier-hover); }
+
+/* Memo images: compact gallery, full-width inline content, wider draft editor. */
+.gloss-image-grid, .gloss-image-editor-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+  width: 100%; margin: 8px 0;
+}
+.gloss-image-grid .gloss-image-tile, .gloss-image-editor-grid .gloss-image-tile {
+  position: relative; display: block; width: 100%; height: auto; aspect-ratio: 1;
+  padding: 0; border: 0; border-radius: 8px; overflow: hidden;
+  background: var(--background-secondary); cursor: zoom-in; box-shadow: none;
+}
+.gloss-image-tile img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.gloss-image-more { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.55); color: white; font-size: 24px; }
+.gloss-card-body img { display: block; width: 100%; height: auto; max-height: none; border-radius: 6px; cursor: zoom-in; }
+.gloss-editor-modal { width: min(720px, calc(100vw - 32px)); }
+.gloss-editor-modal .gloss-edit-ta { width: 100%; min-height: 200px; resize: vertical; }
+.gloss-editor-modal .gloss-image-editor-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gloss-image-edit-tile { min-width: 0; padding: 6px; background: var(--background-secondary); border-radius: 10px; }
+.gloss-image-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 6px 0; }
+.gloss-image-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; }
+.gloss-image-edit-tile .gloss-image-tools button { font-size: 11px; padding: 4px 6px; height: auto; min-height: 28px; }
+.gloss-image-hint, .gloss-upload-status { color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.gloss-image-viewer { width: min(1000px, calc(100vw - 32px)); }
+.gloss-image-stage { overflow: auto; max-height: 70vh; display: block; text-align: center; }
+.gloss-image-stage img { max-width: 100%; max-height: 65vh; object-fit: contain; }
+.gloss-image-stage img.gloss-full-size { max-width: none; max-height: none; }
+.gloss-image-viewer .gloss-image-tools { justify-content: center; }
+.gloss-create { max-height: calc(100vh - 24px); overflow-y: auto; }
+.gloss-image-tile:focus-visible, .gloss-image-tools button:focus-visible, .gloss-card-body img:focus-visible {
+  outline: 2px solid var(--interactive-accent); outline-offset: 2px;
+}
+@media (max-width: 480px) { .gloss-editor-modal .gloss-image-editor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* A single memo surface shared by new annotations and existing drafts. */
+.gloss-editor-modal { width: min(680px, calc(100vw - 32px)); padding: 24px; }
+.gloss-editor-modal .modal-title { font-size: 18px; }
+.gloss-memo-context { margin: 0 0 16px; padding: 0 0 0 12px; border-left: 2px solid var(--background-modifier-border); color: var(--text-muted); font-size: 13px; line-height: 1.6; max-height: 64px; overflow: auto; }
+.gloss-memo-editor { overflow: hidden; border: 1px solid var(--background-modifier-border); border-radius: 12px; background: var(--background-primary); }
+.gloss-memo-tabs { display: flex; gap: 4px; padding: 8px 12px 0; }
+.gloss-memo-tabs button { border: 0; box-shadow: none; background: transparent; color: var(--text-muted); padding: 6px 12px; height: 32px; font-size: 13px; }
+.gloss-memo-tabs button[aria-pressed="true"] { background: var(--background-secondary); color: var(--text-normal); font-weight: 600; }
+.gloss-memo-editor textarea.gloss-memo-input { display: block; box-sizing: border-box; width: 100%; min-height: 220px; max-height: 45vh; margin: 0; padding: 18px; border: 0; border-radius: 0; background: transparent; box-shadow: none; color: var(--text-normal); font: inherit; font-size: 15px; line-height: 1.8; resize: vertical; }
+.gloss-memo-editor textarea.gloss-memo-input:focus { box-shadow: inset 2px 0 0 var(--interactive-accent); outline: none; }
+.gloss-memo-editor [hidden], .gloss-memo-editor textarea[hidden] { display: none !important; }
+.gloss-memo-preview { padding: 18px; min-height: 220px; max-height: 50vh; overflow-y: auto; font-size: 15px; line-height: 1.8; }
+.gloss-memo-editor .gloss-image-editor-grid { box-sizing: border-box; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 0 18px 12px; gap: 10px; max-height: 280px; overflow-y: auto; }
+.gloss-memo-editor .gloss-image-editor-grid:empty { display: none; }
+.gloss-memo-editor .gloss-image-edit-tile { background: transparent; padding: 0; }
+.gloss-memo-editor .gloss-image-name { font-size: 11px; color: var(--text-muted); }
+.gloss-memo-editor .gloss-image-edit-tile .gloss-image-tools { margin: 4px 0; gap: 4px; }
+.gloss-memo-editor .gloss-image-edit-tile .gloss-image-tools button { box-shadow: none; border: 0; background: var(--background-secondary); }
+.gloss-memo-editor .gloss-image-hint { padding: 4px 18px 12px; font-size: 11px; color: var(--text-faint); }
+.gloss-memo-editor .gloss-upload-status:not(:empty) { padding: 8px 18px; }
+.gloss-memo-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--background-modifier-border); background: var(--background-primary); }
+.gloss-memo-footer .gloss-image-tools { margin: 0; }
+.gloss-memo-footer .gloss-image-tools button { background: transparent; box-shadow: none; color: var(--text-muted); }
+.gloss-memo-buttons { display: flex; gap: 8px; margin-left: auto; }
+.gloss-memo-editor button:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
+.gloss-create .gloss-memo-input { min-height: 160px; }
+@media (max-width: 480px) {
+  .gloss-editor-modal { padding: 16px; }
+  .gloss-memo-editor .gloss-image-editor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Type-tinted macOS glass. RGB channels work without color-mix(). */
+.gloss-card.gloss-glass, .gloss-bubble.gloss-glass {
+  --gloss-glass-base: 250, 251, 255;
+  --gloss-glass-opacity: .78;
+  --gloss-glass-edge: rgba(255, 255, 255, .75);
+  --gloss-glass-edge-end: rgba(255, 255, 255, .14);
+  --gloss-glass-shadow: 0 10px 30px rgba(24, 32, 54, .10), 0 3px 12px rgba(var(--gloss-tint-rgb), .12), inset 0 1px 0 rgba(255, 255, 255, .55);
+  background: rgba(var(--gloss-glass-base), .94);
+  background: linear-gradient(145deg, rgba(var(--gloss-tint-rgb), .18), rgba(var(--gloss-tint-rgb), .14)),
+    linear-gradient(rgba(var(--gloss-glass-base), var(--gloss-glass-opacity)), rgba(var(--gloss-glass-base), var(--gloss-glass-opacity)));
+  border: 1px solid var(--gloss-glass-edge);
+  border-radius: 16px;
+  box-shadow: var(--gloss-glass-shadow);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+}
+.gloss-card.gloss-glass { position: relative; }
+.theme-dark .gloss-card.gloss-glass, .theme-dark .gloss-bubble.gloss-glass {
+  --gloss-glass-base: 27, 29, 37;
+  --gloss-glass-opacity: .82;
+  --gloss-glass-edge: rgba(255, 255, 255, .22);
+  --gloss-glass-edge-end: rgba(255, 255, 255, .035);
+  --gloss-glass-shadow: 0 12px 32px rgba(0, 0, 0, .30), 0 3px 14px rgba(var(--gloss-tint-rgb), .10), inset 0 1px 0 rgba(255, 255, 255, .10);
+}
+/* Masked stroke keeps the translucent interior clear; plain border is the fallback. */
+@supports (-webkit-mask-composite: xor) or (mask-composite: exclude) {
+  .gloss-card.gloss-glass::before, .gloss-bubble.gloss-glass::before {
+    content: ""; position: absolute; inset: 0; padding: 1px; border-radius: inherit; pointer-events: none;
+    background: linear-gradient(135deg, var(--gloss-glass-edge), var(--gloss-glass-edge-end) 55%, var(--gloss-glass-edge));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude;
+  }
+}
+.gloss-margin-layer .gloss-card.gloss-glass:hover { box-shadow: var(--gloss-glass-shadow), 0 6px 20px rgba(var(--gloss-tint-rgb), .10); }
+.gloss-card.gloss-glass:focus-within { outline: 2px solid var(--gloss-color); outline-offset: 2px; border-color: var(--gloss-glass-edge); }
+.gloss-card.gloss-glass .gloss-card-quote { background: rgba(var(--gloss-tint-rgb), .07); border-left-color: var(--gloss-color); }
+.gloss-card.gloss-glass .gloss-type-chip { background: rgba(var(--gloss-tint-rgb), .12); }
+/* Bubble owns the material; its inner card must not add another opaque glass layer. */
+.gloss-bubble.gloss-glass .gloss-card.gloss-glass {
+  background: transparent; border: 0; border-radius: 0; box-shadow: none;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+.gloss-bubble.gloss-glass .gloss-card.gloss-glass::before { content: none; }
+.gloss-bubble.gloss-glass .gloss-bubble-head { background: transparent; border-bottom-color: rgba(var(--gloss-tint-rgb), .14); }
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .gloss-card.gloss-glass, .gloss-bubble.gloss-glass { --gloss-glass-opacity: .97; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .gloss-card.gloss-glass, .gloss-bubble.gloss-glass {
+    background: rgb(var(--gloss-glass-base)); -webkit-backdrop-filter: none; backdrop-filter: none;
+  }
+}
+@media (forced-colors: active) {
+  .gloss-card.gloss-glass, .gloss-bubble.gloss-glass { background: Canvas; border: 1px solid CanvasText; box-shadow: none; }
+  .gloss-card.gloss-glass::before, .gloss-bubble.gloss-glass::before { content: none; }
+}
+
+/* Keep display cards quiet; retain keyboard access without shifting the header. */
+.gloss-card .gloss-card-head button.gloss-card-control { opacity: 0; pointer-events: none; }
+.gloss-card:hover .gloss-card-head button.gloss-card-control,
+.gloss-card:focus-within .gloss-card-head button.gloss-card-control { opacity: .85; pointer-events: auto; }
+.gloss-card .gloss-card-head button.gloss-card-control:hover,
+.gloss-card .gloss-card-head button.gloss-card-control:focus-visible { opacity: 1; }
+@media (hover: none) {
+  .gloss-card .gloss-card-head button.gloss-card-control { opacity: .85; pointer-events: auto; }
+}
+
+/* Slow, independently phased color drift; only the tint layer's transform animates. */
+.gloss-glass-flow { display: none; }
+.gloss-card.gloss-glass, .gloss-bubble.gloss-glass { isolation: isolate; }
+.gloss-glass > .gloss-glass-flow {
+  display: block; position: absolute; inset: 0; overflow: hidden;
+  border-radius: inherit; pointer-events: none; z-index: -1;
+}
+.gloss-glass > .gloss-glass-flow::after {
+  content: ""; position: absolute; inset: -25%;
+  background: radial-gradient(ellipse at 28% 34%, rgba(var(--gloss-tint-rgb), .23), transparent 52%),
+    radial-gradient(ellipse at 78% 72%, rgba(var(--gloss-tint-rgb), .13), transparent 48%);
+  animation: gloss-glass-drift var(--gloss-flow-duration, 42s) ease-in-out var(--gloss-flow-delay, 0s) infinite;
+}
+.gloss-bubble.gloss-glass .gloss-card.gloss-glass > .gloss-glass-flow { display: none; }
+@keyframes gloss-glass-drift {
+  0%, 100% { transform: translate(-6%, -4%) rotate(-5deg); }
+  35% { transform: translate(7%, 3%) rotate(6deg); }
+  70% { transform: translate(-2%, 7%) rotate(-2deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gloss-glass > .gloss-glass-flow::after { animation: none; transform: none; }
+}
+@media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+  .gloss-glass > .gloss-glass-flow { display: none; }
+}
+
+.gloss-card-replies[hidden] { display: none; }
+.gloss-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.gloss-card-date { margin-left: auto; text-align: right; }
+.gloss-card .gloss-card-foot button.gloss-reply-toggle { opacity: 0; pointer-events: none; }
+.gloss-card:hover .gloss-card-foot button.gloss-reply-toggle,
+.gloss-card:focus-within .gloss-card-foot button.gloss-reply-toggle { opacity: .85; pointer-events: auto; }
+@media (hover: none) {
+  .gloss-card .gloss-card-foot button.gloss-reply-toggle { opacity: .85; pointer-events: auto; }
+}
+
+/* Avoid negative animated layers beneath a backdrop-filter during scroll compositing. */
+.gloss-glass > .gloss-glass-flow { z-index: 0; }
+.gloss-card.gloss-glass > :not(.gloss-glass-flow),
+.gloss-bubble.gloss-glass > :not(.gloss-glass-flow) { position: relative; z-index: 1; }
+.gloss-card.gloss-glass::before, .gloss-bubble.gloss-glass::before { z-index: 2; }
+
+/* Outside Obsidian's virtualized markdown-preview-sizer, inside the scroll viewport. */
+.gloss-layer-parent { position: relative; }
+
+/* The scrollbar belongs to the inner content, not the glass border's containing block. */
+ .gloss-card { display: flex; flex-direction: column; padding: 14px; max-height: 420px; overflow: hidden; }
+.gloss-card > .gloss-card-head, .gloss-card > .gloss-card-quote, .gloss-card > .gloss-card-foot { flex: 0 0 auto; }
+.gloss-card-scroll { box-sizing: border-box; flex: 0 1 auto; min-height: 0; padding: 0 4px 0 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; }
+.gloss-card-scroll .gloss-reply-list { max-height: none; overflow: visible; }
+.gloss-bubble-body { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.gloss-bubble .gloss-card { min-height: 0; max-height: min(420px, calc(70vh - 80px)); }
+.gloss-bubble .gloss-card-scroll { padding: 0 4px 0 0; overflow-x: hidden; overflow-y: auto; }
+.gloss-card-scroll::-webkit-scrollbar { width: 6px; }
+.gloss-card-scroll::-webkit-scrollbar-track { background: transparent; border: 0; box-shadow: none; }
+.gloss-card-scroll::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb-bg); border-radius: 999px; }
