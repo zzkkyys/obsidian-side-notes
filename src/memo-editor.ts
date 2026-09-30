@@ -60,6 +60,6 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
     ready: composer.ready,
     hasPending: composer.hasPending,
     freeze(value: boolean): void { composer.freeze(value); previewButton.disabled = value; edit.disabled = value; },
-    dispose(): void { disposed = true; clearPreview(); },
+    dispose(): void { disposed = true; clearPreview(); composer.dispose(); },
   };
 }

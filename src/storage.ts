@@ -1,7 +1,8 @@
-import { Notice, type Plugin } from "obsidian";
+import { moveImageReferences } from "./image-model";
+import { Notice, TFile, type Plugin } from "obsidian";
 import {
   ANN_DIR, GHOST_TYPE, GLOSS_DIR, defaultTypes, currentTypeId, migrateBuiltinTypes, isMdPath, legacySafePath, safePath, unsafePath,
-  type GlossDocStore, type GlossEntry, type GlossType,
+  type GlossDocStore, type GlossEntry, type GlossType, type GlossAnnotation,
 } from "./types";
 
 const TYPES_PATH = `${GLOSS_DIR}/types.json`;
@@ -61,6 +62,19 @@ export class GlossStorage {
   private typesBaseline: string | null | undefined;
   private checkingExternal = false;
   private conflictSerial = 0;
+  private conflicts = new Map<string, { backup: string; raw: string }>();
+  private errors = new Map<string, string>();
+  private recovering = new Set<string>();
+  onStatusChange: () => void = () => {};
+  private activePaths: Set<string> | null = null;
+  setActivePaths(paths: string[]): void { this.activePaths = new Set(paths); }
+  get problems(): string[] { return [...new Set([...this.conflicts.keys(), ...this.errors.keys()])]; }
+  get hasProblems(): boolean { return this.problems.length > 0; }
+  private reportError(path: string, error: unknown): void {
+    this.errors.set(path, String(error)); this.onStatusChange();
+    this.warnSave(`Gloss：保存未完成，内容已保留。请运行“处理保存问题”：${path}`);
+  }
+
   /** 全局失效纪元：invalidate()（全局）递增，让进行中的加载回来时不再入缓存 */
   private invalidEpoch = 0;
 
@@ -90,6 +104,7 @@ export class GlossStorage {
       try {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed) && parsed.every(t => t && typeof t.id === "string" && typeof t.name === "string" && typeof t.color === "string" && /^#[\da-f]{3}([\da-f]{3})?$/i.test(t.color))) {
+          this.typesFailed = false;
           this.types = migrateBuiltinTypes(parsed as GlossType[]);
           if (this.types !== parsed) {
             // Persist only after a valid read; a failed migration write leaves the original recoverable.
@@ -112,7 +127,16 @@ export class GlossStorage {
       new Notice("Gloss：批注类型文件不可读，已临时使用默认类型（原文件未覆盖）");
     }
     this.types = defaultTypes();
-    if (!fileExisted && !checkFailed) { this.typesDirty = true; await this.writeTypesNow(); }
+    // 缺失不等于首次安装：同步可能临时移走文件。初始化只读默认值，用户修改时才保存。
+    if (!fileExisted && !checkFailed) {
+      try {
+        const existing = await this.app.vault.adapter.list(ANN_DIR);
+        if (existing.files.length || existing.folders.length) {
+          this.typesFailed = true;
+          new Notice("Gloss：已有批注但类型文件缺失，暂时只读；请等待同步或恢复 types.json");
+        }
+      } catch { /* 新 vault 没有 annotations 目录 */ }
+    }
     return this.types;
   }
 
@@ -124,7 +148,7 @@ export class GlossStorage {
     return this.types.find((t) => t.id === id) ?? this.types.find(t => t.id === currentTypeId(id)) ?? GHOST_TYPE;
   }
 
-  get canEditTypes(): boolean { return !this.typesFailed; }
+  get canEditTypes(): boolean { return !this.typesFailed && !this.conflicts.has(TYPES_PATH) && !this.recovering.has(TYPES_PATH); }
 
   private lastSaveWarning = 0;
   private warnSave(message: string): void {
@@ -135,13 +159,13 @@ export class GlossStorage {
   }
 
   saveTypes(): void {
-    if (this.typesFailed) {
+    if (!this.canEditTypes) {
       this.warnSave("Gloss：类型文件不可读，改动未保存。请先修复 .gloss/types.json");
       return;
     }
     this.typesDirty = true;
     if (this.saveTypesTimer) clearTimeout(this.saveTypesTimer);
-    this.saveTypesTimer = setTimeout(() => { this.saveTypesTimer = null; void this.writeTypesNow().catch(e => console.error("[Gloss] types save failed", e)); }, 250);
+    this.saveTypesTimer = setTimeout(() => { this.saveTypesTimer = null; void this.writeTypesNow().catch(e => this.reportError(TYPES_PATH, e)); }, 250);
   }
 
   private writeTypesNow(): Promise<void> {
@@ -152,11 +176,13 @@ export class GlossStorage {
 
   private async writeTypesImpl(): Promise<void> {
     if (!this.typesDirty || this.typesFailed) return;
+    if (this.conflicts.has(TYPES_PATH)) throw new Error("类型存在未处理的同步冲突");
     const raw = JSON.stringify(this.types, null, 2);
     await this.assertUnchanged(TYPES_PATH, this.typesBaseline, raw);
     await this.ensureParent(TYPES_PATH);
     await this.app.vault.adapter.write(TYPES_PATH, raw);
     this.typesBaseline = raw;
+    this.errors.delete(TYPES_PATH); this.onStatusChange();
     if (JSON.stringify(this.types, null, 2) === raw) this.typesDirty = false;
   }
 
@@ -171,13 +197,21 @@ export class GlossStorage {
     let changed = false;
     try {
       for (const state of this.docs.values()) {
-        if (!state.store || this.isBusy(state) || state.baseline === undefined) continue;
-        const current = await this.diskText(this.docJsonPath(state.path));
-        if (!this.isBusy(state) && current !== state.baseline) { this.invalidate(state.path); changed = true; }
+        if (this.activePaths && !this.activePaths.has(state.path) && !this.isBusy(state) && !state.load && !this.conflicts.has(this.docJsonPath(state.path)) && !this.errors.has(this.docJsonPath(state.path))) {
+          if (state.store) this.storeState.delete(state.store);
+          this.docs.delete(state.path); continue;
+        }
+        if (!state.store || this.isBusy(state) || state.baseline === undefined || this.conflicts.has(this.docJsonPath(state.path))) continue;
+        try {
+          const current = await this.diskText(this.docJsonPath(state.path));
+          // 曾读到的文件暂时缺失时保留原缓存/基线，不降格成全新空文档。
+          if (current === null && state.baseline !== null) continue;
+          if (!this.isBusy(state) && current !== state.baseline) { this.invalidate(state.path); changed = true; }
+        } catch (error) { console.warn(`[Gloss] external read failed: ${state.path}`, error); }
       }
       if (this.typesLoaded && !this.typesDirty && !this.saveTypesTimer && this.typesBaseline !== undefined) {
         const raw = await this.diskText(TYPES_PATH);
-        if (!this.typesDirty && raw !== this.typesBaseline) {
+        if (!this.typesDirty && raw !== null && raw !== this.typesBaseline) {
           this.typesLoaded = false; this.typesFailed = false;
           await this.loadTypes(); changed = true;
         }
@@ -189,13 +223,75 @@ export class GlossStorage {
 
   /** Fail closed: never replace external edits with a stale local document. */
   private async assertUnchanged(path: string, baseline: string | null | undefined, local: string): Promise<void> {
+    if (this.conflicts.has(path)) throw new Error(`尚有未处理的同步冲突：${path}`);
     const remote = await this.diskText(path);
     if (baseline !== undefined && remote === baseline) return;
     const backup = `${GLOSS_DIR}/conflicts/${Date.now()}-${++this.conflictSerial}.json`;
     await this.ensureParent(backup);
     await this.app.vault.adapter.write(backup, local);
-    new Notice(`Gloss：检测到外部修改，已停止覆盖。当前本地版本保存在 ${backup}`);
+    this.conflicts.set(path, { backup, raw: local }); this.onStatusChange();
+    new Notice(`Gloss：同步冲突，未覆盖磁盘。本地版本已备份：${backup}。请运行“处理保存问题”`);
     throw new Error(`External change conflict: ${path}; local copy: ${backup}`);
+  }
+
+  /** 明确由用户选择；先保存当前内存备份，成功后才放弃本地待写状态。 */
+  async recoverDisk(path: string): Promise<void> {
+    await this.waitForMigrations();
+    if (this.recovering.has(path)) throw new Error("此文件正在恢复，请稍候");
+    this.recovering.add(path);
+    try {
+      const state = [...this.docs.values()].find(s => this.docJsonPath(s.path) === path);
+      if (!state && path !== TYPES_PATH) throw new Error("该文档已关闭，请重新打开后处理保存问题");
+      if (state) { if (state.timer) clearTimeout(state.timer); state.timer = null; await state.chain; }
+      else if (path === TYPES_PATH) { if (this.saveTypesTimer) clearTimeout(this.saveTypesTimer); this.saveTypesTimer = null; await this.typesChain; }
+      const disk = await this.diskText(path);
+      if (disk === null) throw new Error("磁盘文件仍缺失，请等待同步完成后重试；本地内容未丢弃");
+      const parsed = JSON.parse(disk);
+      const valid = path === TYPES_PATH
+        ? Array.isArray(parsed) && parsed.every(t => t && typeof t.id === "string" && typeof t.name === "string" && /^#[\da-f]{3}([\da-f]{3})?$/i.test(t.color))
+        : parsed?.docPath === state?.path && Array.isArray(parsed?.entries);
+      if (!valid) throw new Error("磁盘数据格式无效，本地内容未丢弃");
+      const local = state?.store ? JSON.stringify(state.store, null, 2) : JSON.stringify(this.types, null, 2);
+      const previous = this.conflicts.get(path);
+      if (local !== disk && local !== previous?.raw) {
+        const backup = `${GLOSS_DIR}/conflicts/${Date.now()}-${++this.conflictSerial}.json`;
+        await this.ensureParent(backup); await this.app.vault.adapter.write(backup, local);
+      }
+      this.conflicts.delete(path); this.errors.delete(path);
+      if (state) {
+        state.dirtyVer = 0; state.failed = false; this.invalidate(state.path); await this.loadState(state.path);
+      } else {
+        this.typesDirty = false; this.typesLoaded = false; this.typesFailed = false; await this.loadTypes();
+      }
+      this.onStatusChange();
+    } finally { this.recovering.delete(path); }
+  }
+
+  async retrySave(path: string): Promise<void> {
+    if (this.recovering.has(path)) throw new Error("正在载入磁盘版本，请稍候");
+    if (this.conflicts.has(path)) throw new Error("存在同步冲突，请先核对备份并载入磁盘版本；不会自动覆盖远端");
+    const state = [...this.docs.values()].find(s => this.docJsonPath(s.path) === path);
+    if (state) {
+      if (!state.dirtyVer) throw new Error("此操作的草稿仍在编辑窗口中，请返回窗口重试保存");
+      await this.flushState(state);
+    } else if (path === TYPES_PATH) {
+      if (!this.typesDirty) throw new Error("类型草稿仍在管理面板中，请返回面板重试保存");
+      await this.writeTypesNow();
+    } else throw new Error("未找到待保存文档，请重新打开");
+  }
+
+  async saveTypesSnapshot(next: GlossType[], expected: string): Promise<void> {
+    next = JSON.parse(JSON.stringify(next));
+    const task = this.typesChain.then(async () => {
+      if (!this.canEditTypes || JSON.stringify(this.types) !== expected) throw new Error("类型已被其他操作更新。草稿仍保留，请重新核对后修改");
+      const raw = JSON.stringify(next, null, 2);
+      await this.assertUnchanged(TYPES_PATH, this.typesBaseline, raw);
+      await this.ensureParent(TYPES_PATH); await this.app.vault.adapter.write(TYPES_PATH, raw);
+      this.types = next; this.typesBaseline = raw; this.typesDirty = false;
+      this.errors.delete(TYPES_PATH); this.onStatusChange();
+    });
+    this.typesChain = task.catch(error => this.reportError(TYPES_PATH, error));
+    return task;
   }
 
   // ---------- 文档批注 ----------
@@ -300,8 +396,17 @@ export class GlossStorage {
       // 仅在新路径"确认不存在"（exists() 正常返回 false）时尝试：
       // 探测抛异常时状态未知，新文件可能实际存在，迁移会覆盖它
       if (!fileExisted && !readFailed) {
+        const json = this.docJsonPath(docPath);
+        const slash = json.lastIndexOf("/");
+        const placeholder = json.slice(0, slash + 1) + "." + json.slice(slash + 1) + ".icloud";
+        try {
+        if (typeof state.baseline === "string" || await this.app.vault.adapter.exists(placeholder) || await this.app.vault.adapter.exists(json + ".icloud")) {
+          readFailed = true;
+        } else {
         store = await this.tryLegacyMigration(docPath);
         state.baseline = await this.diskText(this.docJsonPath(docPath));
+        }
+        } catch { readFailed = true; }
       }
     }
     if (!store) {
@@ -372,7 +477,7 @@ export class GlossStorage {
   /** 写回（防抖 300ms）；调用前先改 store 内存对象 */
   saveDoc(docPath: string): void {
     const state = this.docs.get(docPath);
-    if (!state || !state.store || state.failed) return;
+    if (!state || !state.store || state.failed || this.conflicts.has(this.docJsonPath(state.path)) || this.recovering.has(this.docJsonPath(state.path))) return;
     this.armSave(state);
   }
 
@@ -383,7 +488,7 @@ export class GlossStorage {
    */
   saveStore(store: GlossDocStore): boolean {
     const state = this.storeState.get(store);
-    if (!state || !state.store || state.failed) {
+    if (!state || !state.store || state.failed || this.conflicts.has(this.docJsonPath(state.path)) || this.recovering.has(this.docJsonPath(state.path))) {
       this.warnSave("Gloss：批注已更新或暂不可写，请重新打开卡片后重试");
       return false;
     }
@@ -408,7 +513,7 @@ export class GlossStorage {
     void (async () => {
       await this.waitForMigrations();
       await this.enqueueWrite(state);
-    })().catch(() => { /* 写入失败保留 dirtyVer */ });
+    })().catch(error => this.reportError(this.docJsonPath(state.path), error));
   }
 
   async flushDoc(docPath: string): Promise<void> {
@@ -444,6 +549,7 @@ export class GlossStorage {
   private async writeDocNow(state: DocState): Promise<void> {
     const store = state.store;
     if (!store || !state.dirtyVer) return;
+    if (this.conflicts.has(this.docJsonPath(state.path))) throw new Error("存在未处理的同步冲突");
     if (state.failed) return; // 读取失败的文档不覆盖原始文件
     const p = state.path;
     if (store.docPath !== p) store.docPath = p;
@@ -454,6 +560,7 @@ export class GlossStorage {
       await this.ensureParent(this.docJsonPath(p));
       await this.app.vault.adapter.write(this.docJsonPath(p), raw);
       state.baseline = raw;
+      this.errors.delete(this.docJsonPath(p)); this.onStatusChange();
       // 仅当"本次写入的版本"仍是当前版本才清脏：
       // V1 写入在途时 V2 已修改，V1 成功不得清除 V2 的脏状态
       if (state.dirtyVer === ver) state.dirtyVer = 0;
@@ -462,6 +569,37 @@ export class GlossStorage {
       console.error(`[Gloss] 写盘失败 ${state.path}（保留脏状态，将重试）:`, e);
       throw e;
     }
+  }
+
+  async commitEntry(store: GlossDocStore, id: string, next: GlossEntry | null, expected: string | null): Promise<void> {
+    next = next ? JSON.parse(JSON.stringify(next)) : null;
+    await this.waitForMigrations();
+    const state = this.storeState.get(store);
+    if (!state || state.store !== store || state.failed || this.recovering.has(this.docJsonPath(state.path))) throw new Error("批注已被更新或暂不可写，草稿仍保留，请重新打开核对");
+    const task = state.chain.then(async () => {
+      if (state.store !== store || state.failed || this.recovering.has(this.docJsonPath(state.path))) throw new Error("批注已失效，草稿仍保留");
+      await this.writeDocNow(state);
+      const old = store.entries.find(e => e.note.id === id);
+      if ((old ? JSON.stringify(old.note) : null) !== expected) throw new Error("此批注已在另一处修改，草稿仍保留；不会覆盖更新的内容");
+      const entries = store.entries.filter(e => e.note.id !== id);
+      if (next) entries.splice(old ? store.entries.indexOf(old) : entries.length, 0, next);
+      const raw = JSON.stringify({ ...store, entries }, null, 2);
+      await this.assertUnchanged(this.docJsonPath(state.path), state.baseline, raw);
+      await this.ensureParent(this.docJsonPath(state.path));
+      await this.app.vault.adapter.write(this.docJsonPath(state.path), raw);
+      // Commit is synchronous: no observer sees a speculative note or failed creation.
+      if (old && next) { Object.assign(old.note, next.note); entries[entries.indexOf(next)] = old; }
+      store.entries = entries; state.baseline = raw;
+      this.errors.delete(this.docJsonPath(state.path)); this.onStatusChange();
+    });
+    state.pendingWrites++;
+    state.chain = task.catch(error => this.reportError(this.docJsonPath(state.path), error)).finally(() => { state.pendingWrites--; });
+    return task;
+  }
+
+  async createEntry(docPath: string, entry: GlossEntry): Promise<void> {
+    const store = await this.loadDoc(docPath);
+    await this.commitEntry(store, entry.note.id, entry, null);
   }
 
   async addEntry(docPath: string, entry: GlossEntry): Promise<void> {
@@ -490,6 +628,42 @@ export class GlossStorage {
     return removed;
   }
 
+  async moveAttachments(oldPath: string, newPath: string, folder = false): Promise<void> {
+    const documents = await this.listAll();
+    for (const { store } of documents) for (const entry of [...store.entries]) {
+      const matches = entry.note.attachments.filter(a => a.path === oldPath || (folder && a.path.startsWith(oldPath + "/")));
+      if (!matches.length) continue;
+      const next: GlossEntry = JSON.parse(JSON.stringify(entry));
+      for (const attachment of matches) {
+        const path = newPath + attachment.path.slice(oldPath.length);
+        next.note.content = moveImageReferences(next.note.content, attachment, path);
+        next.note.attachments.find(a => a.id === attachment.id)!.path = path;
+      }
+      next.note.updatedAt = Date.now();
+      await this.commitEntry(store, entry.note.id, next, JSON.stringify(entry.note));
+    }
+  }
+
+  /** 删除源文档时归档批注；新建同名笔记不继承旧身份。归档失败不删除原 JSON。 */
+  archiveDeleted(docPath: string): Promise<void> {
+    const task = this.migrations.then(async () => {
+      const store = await this.loadState(docPath), state = this.docs.get(docPath)!;
+      if (state.failed) throw new Error("批注不可读，原文件保留，未归档");
+      if (state.baseline === null && !store.entries.length && !state.dirtyVer) { this.docs.delete(docPath); this.storeState.delete(store); return; }
+      await this.flushState(state);
+      const path = this.docJsonPath(docPath), raw = JSON.stringify(store, null, 2);
+      await this.assertUnchanged(path, state.baseline, raw);
+      const backup = `${GLOSS_DIR}/trash/${Date.now()}-${++this.conflictSerial}.json`;
+      await this.ensureParent(backup); await this.app.vault.adapter.write(backup, raw);
+      await this.app.vault.adapter.remove(path);
+      this.storeState.delete(store); state.store = null; state.gen++; this.docs.delete(docPath);
+    });
+    const barrier = task.then(() => undefined, error => this.reportError(this.docJsonPath(docPath), error));
+    this.migrations = barrier; this.migrationBarrier = barrier;
+    void barrier.then(() => { if (this.migrationBarrier === barrier) this.migrationBarrier = null; });
+    return task;
+  }
+
   /** 串行迁移。保存/加载等待整批迁移，旧对象在提交后仍指向同一状态。 */
   migrateDoc(oldPath: string, newPath: string): Promise<boolean> {
     if (oldPath === newPath) return Promise.resolve(true);
@@ -508,6 +682,33 @@ export class GlossStorage {
       const source = await this.loadState(oldPath);
       const sourceState = this.docs.get(oldPath)!;
       if (!source.entries.length && !sourceState.dirtyVer && sourceState.baseline === null && !sourceState.failed) return true;
+      const oldJson = this.docJsonPath(oldPath), targetJson = this.docJsonPath(newPath);
+      const fold = (p: string) => p.normalize("NFC").toLowerCase();
+      if (fold(oldJson) === fold(targetJson) && await this.app.vault.adapter.exists(targetJson)) {
+        const spelling = async (path: string): Promise<string> => {
+          let actual = "";
+          for (const part of path.split("/")) {
+            const listing = await this.app.vault.adapter.list(actual);
+            const names = [...listing.files, ...listing.folders].map(p => p.split("/").pop()!);
+            const name = names.find(n => n === part) ?? names.find(n => fold(n) === fold(part));
+            if (!name) throw new Error("无法确认路径身份，迁移已停止");
+            actual = actual ? `${actual}/${name}` : name;
+          }
+          return actual;
+        };
+        if (await spelling(oldJson) === await spelling(targetJson)) {
+          if (sourceState.failed) throw new Error("源批注不可读");
+          await this.flushState(sourceState);
+          const raw = JSON.stringify({ ...source, docPath: newPath }, null, 2);
+          await this.assertUnchanged(oldJson, sourceState.baseline, raw);
+          await this.app.vault.adapter.write(targetJson, raw);
+          const previous = this.docs.get(newPath);
+          if (previous?.store) this.storeState.delete(previous.store);
+          this.docs.delete(oldPath); sourceState.path = newPath; source.docPath = newPath;
+          sourceState.baseline = raw; this.docs.set(newPath, sourceState);
+          return true; // 同一物理文件，绝不能 remove(oldJson)。
+        }
+      }
       const target = await this.loadState(newPath);
       const state = this.docs.get(oldPath)!;
       const other = this.docs.get(newPath)!;
@@ -639,6 +840,30 @@ export class GlossStorage {
   }
 
   // ---------- 附件 ----------
+
+  /** 只清理调用方本次实际上传的文件；备份、历史归档和笔记引用均受保护。 */
+  async cleanupDraftUploads(paths: string[]): Promise<void> {
+    if (!paths.length || this.migrationBarrier || [...this.docs.values()].some(s => this.isBusy(s))) return;
+    try {
+      const texts: string[] = [...this.docs.values()].filter(s => s.store).map(s => JSON.stringify(s.store));
+      const scan = async (dir: string): Promise<void> => {
+        if (!(await this.app.vault.adapter.exists(dir))) return;
+        const listing = await this.app.vault.adapter.list(dir);
+        for (const file of listing.files) if (file.endsWith(".json")) texts.push(await this.app.vault.adapter.read(`${dir}/${file.split("/").pop()}`));
+        for (const folder of listing.folders) await scan(`${dir}/${folder.split("/").pop()}`);
+      };
+      await scan(GLOSS_DIR);
+      for (const file of this.app.vault.getMarkdownFiles()) texts.push(await this.app.vault.cachedRead(file));
+      for (const path of paths) {
+        const basename = path.split("/").pop()!;
+        const needles = [path, encodeURI(path), path.split("/").map(encodeURIComponent).join("/"), basename, encodeURIComponent(basename)];
+        if (texts.some(text => needles.some(needle => text.includes(needle)))) continue;
+        if (this.migrationBarrier || [...this.docs.values()].some(s => this.isBusy(s))) return;
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) await this.app.vault.trash(file, false);
+      }
+    } catch (error) { console.warn("[Gloss] 附件引用无法完整核实，保留剩余文件", error); }
+  }
 
   async ensureAttachmentsDir(): Promise<string> {
     const folder = (this.plugin?.settings.attachmentsFolder || "gloss-attachments").trim() || "gloss-attachments";

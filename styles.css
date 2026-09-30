@@ -14,7 +14,7 @@
 /* ---------- 选区上方浮泡 ---------- */
 .gloss-pill {
   position: fixed;
-  z-index: 900;
+  z-index: var(--layer-popover, 30);
   transform: translateX(-50%);
   display: none;
   padding: 4px 12px;
@@ -307,7 +307,7 @@
 /* ---------- 新建批注浮层 ---------- */
 .gloss-create {
   position: fixed;
-  z-index: 902;
+  z-index: var(--layer-popover, 30);
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--gloss-r-container);
@@ -357,7 +357,7 @@
 /* ---------- 气泡（窄屏） ---------- */
 .gloss-bubble {
   position: fixed;
-  z-index: 903;
+  z-index: var(--layer-popover, 30);
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--gloss-r-container);
@@ -383,7 +383,7 @@
 /* ---------- 类型菜单 / 类型管理 ---------- */
 .gloss-type-menu {
   position: fixed;
-  z-index: 950;
+  z-index: var(--layer-menu, 65);
   min-width: 160px;
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
@@ -756,3 +756,15 @@
 .gloss-card-scroll::-webkit-scrollbar { width: 6px; }
 .gloss-card-scroll::-webkit-scrollbar-track { background: transparent; border: 0; box-shadow: none; }
 .gloss-card-scroll::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb-bg); border-radius: 999px; }
+
+/* Popovers remain below Obsidian modals; one material/border per surface. */
+.gloss-bubble-body > .gloss-card { background: transparent; border: 0; box-shadow: none; }
+@supports (mask-composite: exclude) or (-webkit-mask-composite: xor) {
+  .gloss-card.gloss-glass, .gloss-bubble.gloss-glass { border-color: transparent; }
+}
+.gloss-flow-paused > .gloss-glass-flow::after { animation-play-state: paused; }
+.gloss-missing-file { display: block; padding: 8px; color: var(--text-muted); font-size: 12px; }
+@media (hover: none) {
+  .gloss-card-control, .gloss-reply-toggle { opacity: 1; visibility: visible; }
+  .gloss-card-head button, .gloss-card-foot button, .gloss-pill { min-width: 44px; min-height: 44px; }
+}

@@ -1,6 +1,6 @@
 import { Notice, type TAbstractFile } from "obsidian";
 import type GlossPlugin from "./main";
-import { GlossBubble } from "./popover";
+import { GlossBubble, SelectionPill } from "./popover";
 import type { GlossEntry, PdfAnchor } from "./types";
 
 /**
@@ -12,6 +12,12 @@ import type { GlossEntry, PdfAnchor } from "./types";
  */
 export class PdfGloss {
   private started = false;
+  private scanTimer: ReturnType<typeof setTimeout> | null = null;
+  private scheduleScan(): void {
+    if (!this.plugin.isAlive) return;
+    if (this.scanTimer) clearTimeout(this.scanTimer);
+    this.scanTimer = setTimeout(() => { this.scanTimer = null; this.scan(); }, 400);
+  }
   /** contentEl → 清理函数 + 视图引用（视图关闭 / 插件卸载时释放观察器与事件） */
   private inited = new Map<HTMLElement, { cleanup: () => void; view: PdfViewLike }>();
 
@@ -21,9 +27,9 @@ export class PdfGloss {
     if (this.started) return;
     this.started = true;
     const ws = this.plugin.app.workspace;
-    ws.onLayoutReady(() => setTimeout(() => this.scan(), 400));
-    this.plugin.registerEvent(ws.on("file-open", () => setTimeout(() => this.scan(), 400)));
-    this.plugin.registerEvent(ws.on("layout-change", () => setTimeout(() => this.scan(), 400)));
+    ws.onLayoutReady(() => this.scheduleScan());
+    this.plugin.registerEvent(ws.on("file-open", () => this.scheduleScan()));
+    this.plugin.registerEvent(ws.on("layout-change", () => this.scheduleScan()));
   }
 
   /** 扫描已打开的 PDF 视图并初始化（幂等） */
@@ -66,6 +72,8 @@ export class PdfGloss {
 
   /** 插件卸载：释放全部监听并清掉高亮层 */
   dispose(): void {
+    if (this.scanTimer) clearTimeout(this.scanTimer);
+    this.scanTimer = null;
     this.clearAll();
   }
 
@@ -174,7 +182,7 @@ export class PdfGloss {
     let selCanvas: HTMLCanvasElement | null = null;
 
     const onDown = (e: MouseEvent) => {
-      if (e.button !== 0) return;
+      if (disposed || !plugin.isAlive || e.button !== 0) return;
       const target = e.target as HTMLElement;
       textStart = null;
       if (!e.altKey) {
@@ -205,12 +213,10 @@ export class PdfGloss {
       selBox.style.width = `${Math.max(0, x1 - x0)}px`;
       selBox.style.height = `${Math.max(0, y1 - y0)}px`;
     };
-    const onUp = (e: MouseEvent) => {
-      if (!dragging) {
-        const start = textStart;
-        textStart = null;
-        if (!start || Math.hypot(e.clientX - start.x, e.clientY - start.y) < 3) return;
-        if (disposed || !plugin.isAlive || e.button !== 0 || !(e.target instanceof Node) || !contentEl.contains(e.target)) return;
+    const pill = new SelectionPill();
+    const updateSelection = () => {
+      pill.hide();
+      if (disposed || !plugin.isAlive) return;
         const selection = window.getSelection();
         if (!selection || selection.isCollapsed || !selection.rangeCount || !view.file) return;
         const range = selection.getRangeAt(0);
@@ -223,12 +229,23 @@ export class PdfGloss {
         const text = selection.toString().trim();
         if (!page || !text || !bounds.width || !bounds.height || !rect.width || !rect.height) return;
         const unit = (v: number) => Math.max(0, Math.min(1, v));
-        plugin.openPdfCreatePopover(view.file.path, { kind: "pdf", page, text: text.slice(0, 400), bbox: [
+        const docPath = view.file.path;
+        const anchor: PdfAnchor = { kind: "pdf", page, text: text.slice(0, 400), bbox: [
           unit((rect.left - bounds.left) / bounds.width), unit((rect.top - bounds.top) / bounds.height),
           unit((rect.right - bounds.left) / bounds.width), unit((rect.bottom - bounds.top) / bounds.height),
-        ] }, rect);
-        return;
-      }
+        ] };
+        const button = pill.ensureEl();
+        button.onmousedown = event => event.preventDefault();
+        button.onclick = () => {
+          if (disposed || !plugin.isAlive || view.file?.path !== docPath) return;
+          pill.hide(); plugin.openPdfCreatePopover(docPath, anchor, rect);
+        };
+        pill.show(rect);
+    };
+    document.addEventListener("selectionchange", updateSelection);
+    cleanups.push(() => { document.removeEventListener("selectionchange", updateSelection); pill.dispose(); });
+    const onUp = (e: MouseEvent) => {
+      if (!dragging) return; // 原生选区仅显示浮泡，由点击明确创建。
       dragging = false;
       const box = selBox;
       const layer = selLayer;
@@ -290,7 +307,7 @@ export class PdfGloss {
     };
 
     contentEl.addEventListener("mousedown", onDown, true);
-    cleanups.push(() => contentEl.removeEventListener("mousedown", onDown));
+    cleanups.push(() => contentEl.removeEventListener("mousedown", onDown, true));
     // document 级监听不用 registerDomEvent（要随视图提前释放，而它只随卸载释放）
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);

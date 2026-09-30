@@ -3,21 +3,22 @@ import type GlossPlugin from "./main";
 import type { GlossAttachment, GlossEntry, GlossType, GlossAnnotation } from "./types";
 import { renderGallery, viewImages, openImageModal } from "./images";
 import { createMemoEditor } from "./memo-editor";
-import { renderImageReferences } from "./image-model";
+import { renderImageReferences, attachmentForSource } from "./image-model";
 import { applyCardStyle } from "./card-style";
 import { fmtTime, uuid } from "./util";
 
 export interface CardHooks {
   /** 内容/类型/回复等变化（已持久化到 store 内存） */
-  onChanged: () => void;
+  onChanged: (next: GlossAnnotation, expected: string) => Promise<void>;
   /** 删除整条批注 */
-  onDeleted: () => void;
+  onDeleted: () => Promise<void>;
 }
 
 /** 卡片内 Markdown 渲染的 Component 追踪（层被清空时统一 unload） */
 const compMap = new WeakMap<HTMLElement, Component[]>();
 // Same annotation object survives normal view refreshes; drafts are not persisted as replies.
-const replyDrafts = new WeakMap<GlossAnnotation, { text: string; open: boolean }>();
+const replyDrafts = new WeakMap<GlossPlugin, Map<string, { text: string; open: boolean }>>();
+const editing = new WeakMap<GlossPlugin, Set<string>>();
 
 export function disposeCompsUnder(root: HTMLElement): void {
   // Component 注册在卡片 body（.gloss-card-body）上，而调用方传入的是卡片根 / 气泡 / 弹层
@@ -40,6 +41,12 @@ function trackComp(card: HTMLElement, comp: Component): void {
 
 export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossType, docPath: string, hooks: CardHooks): HTMLElement {
   const note = entry.note;
+  const key = `${docPath}\0${note.id}`;
+  const copy = (): GlossAnnotation => JSON.parse(JSON.stringify(note));
+  const change = async (next: GlossAnnotation, expected = JSON.stringify(note)) => {
+    try { await hooks.onChanged(next, expected); return true; }
+    catch (error) { new Notice(errMsg(error)); return false; }
+  };
   const card = createEl("div", { cls: "gloss-card" });
   card.dataset.glossId = note.id;
   applyCardStyle(card, plugin.settings, type);
@@ -59,9 +66,8 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   chip.onclick = (e) => {
     e.stopPropagation();
     showTypeMenu(plugin, chip, (tid) => {
-      note.typeId = tid;
-      note.updatedAt = Date.now();
-      hooks.onChanged();
+      const next = copy(); next.typeId = tid; next.updatedAt = Date.now();
+      void change(next);
     });
   };
   head.createSpan({ cls: "gloss-spacer" });
@@ -79,7 +85,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   del.onclick = (e) => {
     e.stopPropagation();
     if (del.dataset.arm) {
-      hooks.onDeleted();
+      void hooks.onDeleted().catch(error => new Notice(errMsg(error)));
     } else {
       del.dataset.arm = "1";
       del.addClass("gloss-armed");
@@ -109,8 +115,9 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
       if (!body.isConnected) return;
       const images = note.attachments.filter(a => a.kind === "image");
       for (const img of Array.from(body.querySelectorAll("img"))) {
-        const a = images.find(a => img.getAttribute("alt") === a.name || img.src === resourceUrl(plugin, a.path));
+        const a = attachmentForSource(images, img.getAttribute("src") ?? img.src, a => resourceUrl(plugin, a.path));
         if (!a) continue;
+        img.onerror = () => { img.replaceWith(createEl("span", { cls: "gloss-missing-file", text: `图片缺失或尚未同步：${a.name}` })); };
         img.tabIndex = 0;
         img.setAttribute("role", "button");
         img.setAttribute("aria-label", `查看大图：${a.name}`);
@@ -123,6 +130,11 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   }
 
   function enterEdit(): void {
+    let active = editing.get(plugin);
+    if (!active) { active = new Set(); editing.set(plugin, active); }
+    if (active.has(key)) return;
+    active.add(key);
+    const expected = JSON.stringify(note);
     const modal = new Modal(plugin.app);
     modal.setTitle("编辑批注");
     modal.modalEl.addClass("gloss-editor-modal");
@@ -130,25 +142,23 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
     modal.contentEl.createDiv({ cls: "gloss-memo-context", text: entry.anchor.text || "所选区域" });
     const composer = createMemoEditor(plugin, modal.contentEl, note.content, note.id, draft, docPath);
     const ta = composer.input;
-    modal.onClose = () => composer.dispose();
+    modal.onClose = () => { active!.delete(key); composer.dispose(); };
     const row = composer.buttons;
     const cancel = row.createEl("button", { text: "取消" });
     const save = row.createEl("button", { text: "保存批注", cls: "mod-cta" });
     cancel.onclick = () => modal.close();
     save.onclick = async () => {
-      save.disabled = true;
+      save.disabled = cancel.disabled = true;
       save.setText("正在保存…");
       composer.freeze(true);
       try {
         await composer.ready();
         if (!modal.contentEl.isConnected || !plugin.isAlive) return;
-        note.content = ta.value;
-        note.attachments = draft;
-        note.updatedAt = Date.now();
-        hooks.onChanged();
+        const next = copy(); next.content = ta.value; next.attachments = draft; next.updatedAt = Date.now();
+        await hooks.onChanged(next, expected);
         modal.close();
       } catch (e) { new Notice(errMsg(e)); }
-      finally { save.disabled = false; save.setText("保存批注"); composer.freeze(false); }
+      finally { save.disabled = cancel.disabled = false; save.setText("保存批注"); composer.freeze(false); }
     };
     ta.onkeydown = e => {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save.click(); }
@@ -177,16 +187,20 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
       row.createEl("video", { cls: "gloss-attach-video", attr: { controls: "controls", src } });
     } else {
       const link = row.createEl("a", { cls: "gloss-attach-file", text: a.name });
-      link.onclick = (e) => { e.preventDefault(); void plugin.app.workspace.openLinkText(a.path, ""); };
+      link.onclick = (e) => {
+        e.preventDefault();
+        const file = plugin.app.vault.getAbstractFileByPath(a.path);
+        if (!(file instanceof TFile)) { new Notice(`附件缺失或尚未同步：${a.name}`); return; }
+        void plugin.app.workspace.getLeaf(false).openFile(file);
+      };
       icon.setText("📄");
     }
     const rm = row.createEl("button", { cls: "gloss-ic gloss-attach-rm", text: "✕" });
     rm.title = "移除附件";
     rm.onclick = () => {
       if (rm.dataset.arm) {
-        note.attachments = note.attachments.filter((x) => x.id !== a.id);
-        note.updatedAt = Date.now();
-        hooks.onChanged();
+        const next = copy(); next.attachments = next.attachments.filter(x => x.id !== a.id); next.updatedAt = Date.now();
+        void change(next);
       } else {
         rm.dataset.arm = "1";
         rm.addClass("gloss-armed");
@@ -197,8 +211,10 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
 
   // ---------- 回复 ----------
   const rep = card.createDiv({ cls: "gloss-card-replies" });
-  const replyDraft = replyDrafts.get(note) ?? { text: "", open: false };
-  replyDrafts.set(note, replyDraft);
+  let drafts = replyDrafts.get(plugin);
+  if (!drafts) { drafts = new Map(); replyDrafts.set(plugin, drafts); }
+  const replyDraft = drafts.get(key) ?? { text: "", open: false };
+  drafts.set(key, replyDraft);
   rep.hidden = !replyDraft.open;
   rep.id = `gloss-replies-${uuid()}`;
   if (note.replies.length) {
@@ -214,15 +230,18 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   ta.value = replyDraft.text;
   ta.addEventListener("input", () => { replyDraft.text = ta.value; });
   const send = inRow.createEl("button", { cls: "gloss-reply-send", text: "回复" });
-  const doSend = () => {
+  const doSend = async () => {
     const v = ta.value.trim();
-    if (!v) return;
-    note.replies.push({ id: uuid(), content: v, createdAt: Date.now() });
-    note.updatedAt = Date.now();
-    ta.value = "";
-    replyDraft.text = "";
-    replyDraft.open = true;
-    hooks.onChanged();
+    if (!v || send.disabled) return;
+    send.disabled = true;
+    const next = copy();
+    next.replies.push({ id: uuid(), content: v, createdAt: Date.now() }); next.updatedAt = Date.now();
+    if (await change(next)) {
+      ta.value = ""; replyDraft.text = ""; replyDraft.open = true;
+      const row = rep.createDiv({ cls: "gloss-reply" }); row.setText(v);
+      row.scrollIntoView?.({ block: "nearest" });
+    }
+    send.disabled = false;
   };
   send.onclick = doSend;
   ta.addEventListener("keydown", (e) => {
@@ -300,7 +319,7 @@ export function resourceUrl(plugin: GlossPlugin, path: string): string {
       return plugin.app.vault.getResourcePath(f);
     } catch { /* fallthrough */ }
   }
-  return `obsidian://${path}`;
+  return plugin.app.vault.adapter.getResourcePath(path);
 }
 
 // ---------- 文件选择 ----------

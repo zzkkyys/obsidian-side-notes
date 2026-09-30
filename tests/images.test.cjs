@@ -44,7 +44,13 @@ class Element {
   setText(text) { this.text = text; }
   setAttribute() {}
   addEventListener(name, cb) { this.listeners[name] = cb; }
-  setRangeText(text, start, end) { this.value = this.value.slice(0, start) + text + this.value.slice(end); this.selectionStart = this.selectionEnd = start + text.length; }
+  setRangeText(text, start, end, mode) {
+    const a = this.selectionStart, b = this.selectionEnd;
+    this.value = this.value.slice(0, start) + text + this.value.slice(end);
+    const map = position => position <= start ? position : position >= end ? position + text.length - (end - start) : start + text.length;
+    this.selectionStart = mode === 'preserve' ? map(a) : start + text.length;
+    this.selectionEnd = mode === 'preserve' ? map(b) : start + text.length;
+  }
   focus() {}
   remove() { this.isConnected = false; }
 }
@@ -124,7 +130,7 @@ test('memo editor restores existing multiline content on Obsidian versions ignor
   const m = { exports: {} };
   const source = ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname, '../src/memo-editor.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText;
   vm.runInNewContext(source, { module: m, exports: m.exports, require: name => name === './image-model' ? moduleImage.exports : name === './images' ? {
-    imageComposer: () => ({ actions: new LegacyElement(), gallery: new LegacyElement(), ready: async () => {}, freeze() {} }),
+    imageComposer: () => ({ actions: new LegacyElement(), gallery: new LegacyElement(), ready: async () => {}, freeze() {}, dispose() {} }),
     renderGallery() {},
   } : {} });
   const original = '原有批注 **重点**\n第二段\n' + imageMarkdown(a);
@@ -134,4 +140,19 @@ test('memo editor restores existing multiline content on Obsidian versions ignor
   editor.input.value += '\n新增想法';
   assert.equal(editor.input.value, original + '\n新增想法');
   editor.dispose();
+});
+
+test('two attachments with identical labels open by destination rather than first alt match', () => {
+  const images = [{ id: 'one', name: 'image.png', path: 'image.png' }, { id: 'two', name: 'image.png', path: 'image (1).png' }];
+  assert.equal(moduleImage.exports.attachmentForSource(images, 'app://image (1).png', a => 'app://' + a.path).id, 'two');
+});
+
+test('upload completion preserves a caret that the user moved elsewhere', async () => {
+  let release, began; const started = new Promise(r => began = r), gate = new Promise(r => release = r);
+  const h = composerHarness(async () => { began(); await gate; return 'images/new.png'; });
+  h.paste([file('image.png')]); await started;
+  h.ta.selectionStart = h.ta.selectionEnd = 2;
+  release(); await h.composer.ready();
+  assert.equal(h.ta.selectionStart, 2); assert.equal(h.ta.selectionEnd, 2);
+  assert.ok(h.ta.value.includes('images/new.png'));
 });

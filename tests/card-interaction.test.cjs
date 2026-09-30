@@ -17,23 +17,55 @@ class El {
 }
 function find(el, cls) { if (el.cls.split(' ').includes(cls)) return el; for (const child of el.children) { const hit = find(child, cls); if (hit) return hit; } }
 const m = { exports: {} }; let uuid = 0;
+let lastModal, lastComposer;
+class Modal {
+  constructor() { lastModal = this; this.contentEl = new El('div'); this.contentEl.isConnected = true; this.modalEl = { addClass() {} }; }
+  setTitle() {} open() {} close() { this.closed = true; this.onClose?.(); }
+}
 vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/card.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText, {
   module: m, exports: m.exports, createEl: (tag, o) => new El(tag, o),
-  require: name => name === 'obsidian' ? { setIcon() {} } : name === './util' ? { uuid: () => String(++uuid), fmtTime: () => 'now' } : name === './card-style' ? { applyCardStyle() {} } : name === './images' ? { renderGallery() {} } : {},
+  require: name => name === 'obsidian' ? { setIcon() {}, Notice: class {}, Modal } : name === './util' ? { uuid: () => String(++uuid), fmtTime: () => 'now' } : name === './card-style' ? { applyCardStyle() {} } : name === './images' ? { renderGallery() {}, openImageModal(_plugin, modal) { modal.open(); } } : name === './memo-editor' ? { createMemoEditor() { const input = { value: '', focus() {}, setSelectionRange() {} }; return lastComposer = { input, buttons: new El('div'), ready: async () => {}, freeze() {}, dispose() {} }; } } : {},
 });
-test('ordinary card rebuild preserves the reply draft and expanded state; send clears only that draft', () => {
+test('ordinary card rebuild preserves the reply draft and expanded state; send clears only that draft', async () => {
   const entry = { anchor: { text: 'quote' }, note: { id: 'n', content: '', attachments: [], replies: [], createdAt: 1 } };
-  const hooks = { onChanged() {}, onDeleted() {} };
-  const build = () => m.exports.buildCard({}, entry, { emoji: '', name: 'test' }, 'doc.md', hooks);
+  const plugin = {};
+  const hooks = { async onChanged(next) { Object.assign(entry.note, next); }, async onDeleted() {} };
+  const build = () => m.exports.buildCard(plugin, entry, { emoji: '', name: 'test' }, 'doc.md', hooks);
   let card = build();
   find(card, 'gloss-reply-toggle').onclick({ stopPropagation() {} });
   const ta = find(card, 'gloss-reply-ta'); ta.value = 'unfinished reply'; ta.listeners.input();
   card = build();
   assert.equal(find(card, 'gloss-reply-ta').value, 'unfinished reply');
   assert.equal(find(card, 'gloss-card-replies').hidden, false);
-  find(card, 'gloss-reply-send').onclick();
+  await find(card, 'gloss-reply-send').onclick();
   card = build();
   assert.equal(find(card, 'gloss-reply-ta').value, '');
   assert.equal(entry.note.replies[0].content, 'unfinished reply');
   assert.equal(find(card, 'gloss-card-replies').hidden, false);
+});
+
+
+test('rejected reply retains text even after store identity changes', async () => {
+  const plugin = {};
+  const entry = { anchor: { text: 'quote' }, note: { id: 'stale', content: '', attachments: [], replies: [], createdAt: 1 } };
+  const hooks = { async onChanged() { throw Error('stale store'); }, async onDeleted() {} };
+  let card = m.exports.buildCard(plugin, entry, {}, 'doc.md', hooks);
+  const ta = find(card, 'gloss-reply-ta'); ta.value = 'do not lose this'; ta.listeners.input();
+  await find(card, 'gloss-reply-send').onclick();
+  assert.equal(ta.value, 'do not lose this');
+  assert.equal(entry.note.replies.length, 0);
+  card = m.exports.buildCard(plugin, JSON.parse(JSON.stringify(entry)), {}, 'doc.md', hooks);
+  assert.equal(find(card, 'gloss-reply-ta').value, 'do not lose this');
+});
+
+
+test('a rejected editor save keeps the modal and its text, leaving the published note untouched', async () => {
+  const plugin = { isAlive: true }, entry = { anchor: { text: 'quote' }, note: { id: 'editor-test', content: '', attachments: [], replies: [], createdAt: 1 } };
+  const card = m.exports.buildCard(plugin, entry, {}, 'doc.md', { async onChanged() { throw Error('version changed'); }, async onDeleted() {} });
+  find(card, 'gloss-card-control').onclick({ stopPropagation() {} });
+  lastComposer.input.value = 'several minutes of writing';
+  await find(lastComposer.buttons, 'mod-cta').onclick();
+  assert.notEqual(lastModal.closed, true);
+  assert.equal(lastComposer.input.value, 'several minutes of writing');
+  assert.equal(entry.note.content, '');
 });

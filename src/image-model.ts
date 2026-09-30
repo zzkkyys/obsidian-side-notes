@@ -48,3 +48,13 @@ export function moveAttachment(items: GlossAttachment[], id: string, target: str
   if (from < 0 || to < 0 || from === to) return;
   items.splice(to, 0, items.splice(from, 1)[0]);
 }
+
+/** Alt labels need not be unique; match the resource destination only. */
+export function attachmentForSource(images: GlossAttachment[], source: string, resource: (a: GlossAttachment) => string): GlossAttachment | undefined {
+  return images.find(a => resource(a) === source);
+}
+
+export function moveImageReferences(content: string, attachment: GlossAttachment, newPath: string): string {
+  for (const ref of references(content, attachment)) content = content.split(ref).join(imageMarkdown({ ...attachment, path: newPath }));
+  return content;
+}

@@ -5,6 +5,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
 
+const notices = [];
+class MockTFile { constructor(path) { this.path = path; } }
 const modules = new Map();
 function load(name) {
   if (modules.has(name)) return modules.get(name);
@@ -13,7 +15,7 @@ function load(name) {
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText;
   vm.runInNewContext(code, { module, exports: module.exports, Blob, setTimeout, clearTimeout,
     console: { log() {}, warn() {}, error() {} },
-    require: p => p === 'obsidian' ? { Notice: class {}, ItemView: class {}, Component: class {}, TFile: class {} } : load(p.slice(2)) });
+    require: p => p === 'obsidian' ? { Notice: class { constructor(message) { notices.push(message); } }, ItemView: class {}, Component: class {}, TFile: MockTFile } : load(p.slice(2)) });
   modules.set(name, module.exports);
   return module.exports;
 }
@@ -30,7 +32,7 @@ function fixture(initial = {}) {
     const parts = file.split('/');
     for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
   }
-  const parent = p => p.slice(0, p.lastIndexOf('/'));
+  const parent = p => p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
   const adapter = {
     exists: async p => disk.has(p) || dirs.has(p),
     read: async p => { if (!disk.has(p)) throw Error('ENOENT'); return disk.get(p); },
@@ -39,7 +41,7 @@ function fixture(initial = {}) {
     remove: async p => disk.delete(p),
     list: async p => ({ files: [...disk.keys()].filter(k => parent(k) === p), folders: [...dirs].filter(k => k && parent(k) === p) }),
   };
-  const vault = { adapter, createBinary: async (p, bytes) => { if (disk.has(p)) throw Error('exists'); await adapter.write(p, bytes); } };
+  const vault = { adapter, getMarkdownFiles: () => [], getAbstractFileByPath: p => disk.has(p) ? new MockTFile(p) : null, trash: async file => { disk.set(".trash/" + file.path.split("/").pop(), disk.get(file.path)); disk.delete(file.path); }, createBinary: async (p, bytes) => { if (disk.has(p)) throw Error('exists'); await adapter.write(p, bytes); } };
   return { storage: new GlossStorage({ app: { vault } }), adapter, disk };
 }
 const ids = store => Array.from(store.entries, e => e.note.id);
@@ -216,4 +218,166 @@ test('corrupt type data disables editing and attempted saves preserve disk', asy
   f.storage.saveTypes();
   await f.storage.flushAll();
   assert.equal(f.disk.get('.gloss/types.json'), '{broken');
+});
+
+
+test('conflict freezes further writes, keeps one backup and can explicitly reload remote', async () => {
+  const p = 'conflict.md', f = fixture({ [jsonPath(p)]: raw(p, 'A') });
+  const store = await f.storage.loadDoc(p);
+  f.disk.set(jsonPath(p), raw(p, 'A', 'remote'));
+  store.entries.push(note('local')); f.storage.saveStore(store);
+  await assert.rejects(f.storage.flushDoc(p));
+  assert.equal(f.storage.saveStore(store), false);
+  await f.storage.flushAll(); await f.storage.checkExternalChanges();
+  assert.equal([...f.disk.keys()].filter(p => p.startsWith('.gloss/conflicts/')).length, 1);
+  await f.storage.recoverDisk(jsonPath(p));
+  assert.deepEqual(ids(await f.storage.loadDoc(p)), ['A', 'remote']);
+  assert.equal(f.storage.hasProblems, false);
+});
+
+test('temporary absence preserves cached annotations and types and never initializes over them', async () => {
+  const p = 'missing.md';
+  const types = JSON.stringify([{ id: 'custom', name: 'Custom', color: '#123456', order: 0 }]);
+  const f = fixture({ [jsonPath(p)]: raw(p, 'A', 'B'), '.gloss/types.json': types });
+  const store = await f.storage.loadDoc(p); await f.storage.loadTypes();
+  f.disk.delete(jsonPath(p)); f.disk.delete('.gloss/types.json');
+  await f.storage.checkExternalChanges();
+  assert.equal(await f.storage.loadDoc(p), store);
+  assert.deepEqual(ids(store), ['A', 'B']);
+  assert.equal(f.storage.types[0].id, 'custom');
+  assert.equal(f.disk.has('.gloss/types.json'), false);
+  const restarted = fixture({ [jsonPath(p)]: raw(p, 'A') });
+  await restarted.storage.loadTypes();
+  assert.equal(restarted.storage.canEditTypes, false);
+  assert.equal(restarted.disk.has('.gloss/types.json'), false);
+});
+
+test('failed creation never becomes visible or gets saved by a later unrelated edit', async () => {
+  const p = 'create.md', f = fixture({ [jsonPath(p)]: raw(p, 'A') });
+  const store = await f.storage.loadDoc(p), write = f.adapter.write;
+  f.adapter.write = async () => { throw Error('EACCES'); };
+  await assert.rejects(f.storage.createEntry(p, note('cancelled')));
+  assert.deepEqual(ids(store), ['A']);
+  assert.equal(f.storage.hasProblems, true);
+  f.adapter.write = write;
+  const old = store.entries[0], next = note('A'); next.note.content = 'edited';
+  await f.storage.commitEntry(store, 'A', next, JSON.stringify(old.note));
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['A']);
+});
+
+test('stale store and concurrent editor snapshots cannot overwrite a newer annotation', async () => {
+  const p = 'edit.md', f = fixture({ [jsonPath(p)]: raw(p, 'A') });
+  const store = await f.storage.loadDoc(p), expected = JSON.stringify(store.entries[0].note);
+  const next = note('A'); next.note.content = 'first editor';
+  await f.storage.commitEntry(store, 'A', next, expected);
+  await assert.rejects(f.storage.commitEntry(store, 'A', note('A'), expected));
+  f.disk.set(jsonPath(p), raw(p, 'remote')); await f.storage.checkExternalChanges();
+  await assert.rejects(f.storage.commitEntry(store, 'A', next, JSON.stringify(next.note)));
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['remote']);
+});
+
+test('a failing poll does not block another document from observing its remote update', async () => {
+  const f = fixture({ [jsonPath('a.md')]: raw('a.md', 'A'), [jsonPath('b.md')]: raw('b.md', 'B') });
+  await f.storage.loadDoc('a.md'); await f.storage.loadDoc('b.md');
+  const read = f.adapter.read;
+  f.adapter.read = p => p === jsonPath('a.md') ? Promise.reject(Error('offline')) : read(p);
+  f.disk.set(jsonPath('b.md'), raw('b.md', 'new'));
+  await f.storage.checkExternalChanges();
+  assert.deepEqual(ids(await f.storage.loadDoc('b.md')), ['new']);
+});
+
+test('types editor snapshot rejects replacement of an externally refreshed array', async () => {
+  const f = fixture({ '.gloss/types.json': '[]' }); await f.storage.loadTypes();
+  const expected = JSON.stringify(f.storage.types);
+  f.disk.set('.gloss/types.json', JSON.stringify([{ id: 'r', name: 'remote', color: '#123456' }]));
+  await f.storage.checkExternalChanges();
+  await assert.rejects(f.storage.saveTypesSnapshot([], expected));
+  assert.equal(JSON.parse(f.disk.get('.gloss/types.json'))[0].id, 'r');
+});
+
+test('case-only rename on insensitive storage preserves the single physical file', async () => {
+  const f = fixture({ [jsonPath('Note.md')]: raw('Note.md', 'A') });
+  const resolve = p => [...f.disk.keys()].find(k => k.toLowerCase() === p.toLowerCase()) || p;
+  const exists = f.adapter.exists, read = f.adapter.read, write = f.adapter.write, remove = f.adapter.remove;
+  f.adapter.exists = p => exists(resolve(p)); f.adapter.read = p => read(resolve(p));
+  f.adapter.write = (p, value) => write(resolve(p), value); f.adapter.remove = p => remove(resolve(p));
+  await f.storage.loadDoc('Note.md');
+  assert.equal(await f.storage.migrateDoc('Note.md', 'note.md'), true);
+  assert.deepEqual(ids(await f.storage.loadDoc('note.md')), ['A']);
+  assert.equal(JSON.parse(f.disk.get(jsonPath('Note.md'))).docPath, 'note.md');
+});
+
+test('case-distinct files on sensitive storage are merged rather than treated as one file', async () => {
+  const f = fixture({ [jsonPath('Note.md')]: raw('Note.md', 'A'), [jsonPath('note.md')]: raw('note.md', 'B') });
+  assert.equal(await f.storage.migrateDoc('Note.md', 'note.md'), true);
+  assert.deepEqual(ids(await f.storage.loadDoc('note.md')), ['A', 'B']);
+});
+
+test('deleted document archive isolates a new file with the same path', async () => {
+  const p = 'deleted.md', f = fixture({ [jsonPath(p)]: raw(p, 'OLD') });
+  const old = await f.storage.loadDoc(p);
+  await f.storage.archiveDeleted(p);
+  assert.equal(f.disk.has(jsonPath(p)), false);
+  assert.equal([...f.disk.keys()].filter(p => p.startsWith('.gloss/trash/')).length, 1);
+  assert.equal(f.storage.saveStore(old), false);
+  const fresh = await f.storage.loadDoc(p); assert.deepEqual(ids(fresh), []);
+  await f.storage.createEntry(p, note('NEW'));
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['NEW']);
+});
+test('archive failure retains source JSON and cached identity', async () => {
+  const p = 'deleted.md', f = fixture({ [jsonPath(p)]: raw(p, 'OLD') });
+  const old = await f.storage.loadDoc(p), write = f.adapter.write;
+  f.adapter.write = async (p, raw) => { if (p.startsWith('.gloss/trash/')) throw Error('full'); return write(p, raw); };
+  await assert.rejects(f.storage.archiveDeleted(p));
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['OLD']);
+  assert.equal(await f.storage.loadDoc(p), old);
+});
+test('an iCloud placeholder is not treated as an unannotated new document', async () => {
+  const p = 'cloud.md', json = jsonPath(p), slash = json.lastIndexOf('/');
+  const f = fixture({ [json.slice(0, slash + 1) + '.' + json.slice(slash + 1) + '.icloud']: 'placeholder' });
+  const store = await f.storage.loadDoc(p);
+  assert.equal(f.storage.saveStore(store), false);
+  await assert.rejects(f.storage.createEntry(p, note('NEW')));
+  assert.equal(f.disk.has(json), false);
+});
+test('attachment rename updates both metadata and encoded inline references', async () => {
+  const p = 'pic.md', entry = note('A');
+  entry.note.attachments = [{ id: 'pic', kind: 'image', path: 'old/a.png', name: 'a.png' }];
+  entry.note.content = '![[old/a.png]]';
+  const f = fixture({ [jsonPath(p)]: JSON.stringify({ version: 1, docPath: p, kind: 'md', entries: [entry] }) });
+  await f.storage.moveAttachments('old', 'new', true);
+  const saved = JSON.parse(f.disk.get(jsonPath(p))).entries[0].note;
+  assert.equal(saved.attachments[0].path, 'new/a.png');
+  assert.ok(saved.content.includes('new/a.png'));
+});
+
+
+test('background write errors show a user notice and preserve dirty data for retry', async () => {
+  const p = 'denied.md', f = fixture({ [jsonPath(p)]: raw(p, 'A') });
+  const store = await f.storage.loadDoc(p), write = f.adapter.write;
+  store.entries.push(note('local')); f.adapter.write = async () => { throw Error('EACCES'); };
+  const before = notices.length; f.storage.saveStore(store);
+  await new Promise(resolve => setTimeout(resolve, 340));
+  assert.ok(notices.length > before);
+  assert.ok(f.storage.pendingSave(p));
+  f.adapter.write = write; await f.storage.retrySave(jsonPath(p));
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['A', 'local']);
+});
+test('draft cleanup protects backup references and only trashes this session unreferenced uploads', async () => {
+  const f = fixture({
+    'gloss-attachments/n/keep.png': 'image', 'gloss-attachments/n/cancel.png': 'image',
+    'gloss-attachments/older/other.png': 'image',
+    '.gloss/conflicts/backup.json': JSON.stringify({ path: 'gloss-attachments/n/keep.png' }),
+  });
+  await f.storage.cleanupDraftUploads(['gloss-attachments/n/keep.png', 'gloss-attachments/n/cancel.png']);
+  assert.ok(f.disk.has('gloss-attachments/n/keep.png'));
+  assert.ok(f.disk.has('gloss-attachments/older/other.png'));
+  assert.equal(f.disk.has('gloss-attachments/n/cancel.png'), false);
+  assert.ok(f.disk.has('.trash/cancel.png'));
+});
+test('draft cleanup keeps all uploads if even one reference file cannot be read', async () => {
+  const f = fixture({ 'gloss-attachments/n/new.png': 'image', '.gloss/conflicts/backup.json': '{}' });
+  f.adapter.read = async () => { throw Error('offline'); };
+  await f.storage.cleanupDraftUploads(['gloss-attachments/n/new.png']);
+  assert.ok(f.disk.has('gloss-attachments/n/new.png'));
 });

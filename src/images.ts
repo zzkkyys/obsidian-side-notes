@@ -42,6 +42,7 @@ export function viewImages(plugin: GlossPlugin, images: GlossAttachment[], selec
       this.setTitle(`${a.name} · ${this.index + 1} / ${images.length}`);
       const stage = this.contentEl.createDiv({ cls: "gloss-image-stage" });
       const img = stage.createEl("img", { attr: { src: url(plugin, a), alt: a.name } });
+      img.onerror = () => { img.hidden = true; stage.createDiv({ text: `图片缺失或尚未同步：${a.name}` }); };
       const row = this.contentEl.createDiv({ cls: "gloss-image-tools" });
       const prev = row.createEl("button", { text: "上一张" });
       prev.disabled = images.length < 2;
@@ -69,7 +70,8 @@ export function renderGallery(plugin: GlossPlugin, parent: HTMLElement, attachme
     const shown = expanded ? bottom : bottom.slice(0, 4);
     shown.forEach((a, i) => {
       const button = grid.createEl("button", { cls: "gloss-image-tile", attr: { "aria-label": `查看图片：${a.name}` } });
-      button.createEl("img", { attr: { src: url(plugin, a), alt: a.name, loading: "lazy" } });
+      const image = button.createEl("img", { attr: { src: url(plugin, a), alt: a.name, loading: "lazy" } });
+      image.onerror = () => { image.hidden = true; button.createSpan({ cls: "gloss-missing-file", text: "图片缺失或未同步" }); };
       if (!expanded && bottom.length > 4 && i === 3) {
         button.createSpan({ cls: "gloss-image-more", text: `+${bottom.length - 3}` });
         button.setAttribute("aria-label", `展开全部 ${bottom.length} 张图片`);
@@ -84,6 +86,16 @@ export function renderGallery(plugin: GlossPlugin, parent: HTMLElement, attachme
 export function imageComposer(plugin: GlossPlugin, root: HTMLElement, ta: HTMLTextAreaElement, noteId: string, attachments: GlossAttachment[]) {
   let chain: Promise<void> = Promise.resolve();
   let frozen = false;
+  let disposed = false;
+  let cleanupStarted = false;
+  const uploaded: string[] = [];
+  const cleanup = () => {
+    if (!disposed || frozen || cleanupStarted) return;
+    cleanupStarted = true;
+    void chain.then(async () => {
+      if (plugin.isAlive) await plugin.storage.cleanupDraftUploads(uploaded);
+    }).catch(error => console.warn("[Gloss] draft attachment cleanup failed", error));
+  };
   let pending = 0;
   const failures = new Set<string>();
   const actions = root.createDiv({ cls: "gloss-image-tools" });
@@ -147,10 +159,11 @@ export function imageComposer(plugin: GlossPlugin, root: HTMLElement, ta: HTMLTe
           const path = await plugin.storage.saveBinary(folder, noteId, f.name.replace(/[\\/:*?"<>|]/g, "_"), f);
           const a: GlossAttachment = { id: uuid(), path, name: f.name, mime: f.type || "application/octet-stream", size: f.size,
             kind: isImage ? "image" : f.type.startsWith("audio/") ? "audio" : f.type.startsWith("video/") ? "video" : "file" };
+          uploaded.push(path);
           attachments.push(a);
-          if (marker) ta.value = ta.value.replace(marker, `\n${imageMarkdown(a)}\n`);
+          if (marker) replaceUploadMarker(ta, marker, `\n${imageMarkdown(a)}\n`);
         } catch (error) {
-          if (marker) ta.value = ta.value.replace(marker, "");
+          if (marker) replaceUploadMarker(ta, marker, "");
           failures.add(f.name);
           new Notice(`附件 ${f.name} 保存失败：${String(error)}`);
         } finally {
@@ -191,6 +204,14 @@ export function imageComposer(plugin: GlossPlugin, root: HTMLElement, ta: HTMLTe
     actions, gallery,
     hasPending: () => pending > 0,
     async ready(): Promise<void> { await chain; if (failures.size) throw new Error("部分附件上传失败，请重试或选择忽略失败附件"); },
-    freeze(value: boolean): void { frozen = value; add.disabled = value; ta.disabled = value; hint.hidden = value; render(); },
+    dispose(): void { disposed = true; cleanup(); },
+    freeze(value: boolean): void { frozen = value; cleanup(); add.disabled = value; ta.disabled = value; hint.hidden = value; render(); },
   };
+}
+
+/** Replace only the upload token and map the user's current selection through that edit. */
+export function replaceUploadMarker(ta: HTMLTextAreaElement, marker: string, replacement: string): void {
+  const at = ta.value.indexOf(marker);
+  if (at < 0) return;
+  ta.setRangeText(replacement, at, at + marker.length, "preserve");
 }

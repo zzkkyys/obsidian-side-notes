@@ -1,4 +1,4 @@
-import { App, Modal } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
 import type GlossPlugin from "./main";
 import type { GlossType } from "./types";
 import { uuid } from "./util";
@@ -17,7 +17,7 @@ export class TypeManagerModal extends Modal {
     contentEl.createEl("h3", { text: "管理批注类型" });
     contentEl.createDiv({
       cls: "gloss-tm-hint",
-      text: "点击名称 / Emoji / 色块就地修改；拖动 ⋮⋮（或按 ↑↓）排序；改动即时生效于全库。",
+      text: "点击名称 / Emoji / 色块就地修改；拖动 ⋮⋮（或按 ↑↓）排序；点击“保存并关闭”后生效；外部变更时保留草稿并阻止覆盖。",
     });
     if (!this.plugin.storage.canEditTypes) {
       contentEl.createDiv({ text: "类型文件不可读，暂时无法编辑。请修复 .gloss/types.json 后重新打开此面板。" });
@@ -25,19 +25,13 @@ export class TypeManagerModal extends Modal {
     }
     const list = contentEl.createDiv({ cls: "gloss-tm-list" });
 
-    const persist = (refresh = true) => {
-      this.plugin.storage.saveTypes();
-      // 默认类型被删时回退到第一个
-      if (!this.plugin.storage.types.some((t) => t.id === this.plugin.settings.defaultTypeId)) {
-        this.plugin.settings.defaultTypeId = this.plugin.storage.types[0]?.id ?? "general";
-        void this.plugin.saveSettings();
-      }
-      if (refresh) this.plugin.refreshAll();
-    };
+    const expected = JSON.stringify(this.plugin.storage.types);
+    const draft: GlossType[] = JSON.parse(expected);
+    const persist = () => {}; // 编辑独立草稿；保存成功前不改变共享类型。
 
     const render = () => {
       list.empty();
-      const types = this.plugin.storage.sortedTypes();
+      const types = [...draft].sort((a, b) => a.order - b.order);
       let dragged: string | null = null;
 
       const setOrder = (arr: GlossType[]) => {
@@ -81,8 +75,8 @@ export class TypeManagerModal extends Modal {
         del.title = "删除类型（再点一次确认）";
         del.onclick = () => {
           if (del.dataset.arm) {
-            this.plugin.storage.types = this.plugin.storage.types.filter((x) => x.id !== t.id);
-            setOrder(this.plugin.storage.types);
+            draft.splice(draft.findIndex(x => x.id === t.id), 1);
+            setOrder(draft);
           } else {
             del.dataset.arm = "1";
             del.addClass("gloss-armed");
@@ -115,13 +109,24 @@ export class TypeManagerModal extends Modal {
     const foot = contentEl.createDiv({ cls: "gloss-tm-foot" });
     const add = foot.createEl("button", { text: "＋ 新建类型" });
     add.onclick = () => {
-      const maxOrder = this.plugin.storage.types.reduce((m, t) => Math.max(m, t.order), -1);
-      this.plugin.storage.types.push({ id: uuid().slice(0, 8), name: "新类型", color: "#3b82f6", emoji: "📝", order: maxOrder + 1 });
+      const maxOrder = draft.reduce((m, t) => Math.max(m, t.order), -1);
+      draft.push({ id: uuid().slice(0, 8), name: "新类型", color: "#3b82f6", emoji: "📝", order: maxOrder + 1 });
       persist();
       render();
     };
-    const done = foot.createEl("button", { cls: "gloss-primary", text: "完成" });
-    done.onclick = () => this.close();
+    const done = foot.createEl("button", { cls: "gloss-primary", text: "保存并关闭" });
+    done.onclick = async () => {
+      const controls = Array.from(contentEl.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button"));
+      controls.forEach(control => { control.disabled = true; });
+      try {
+        await this.plugin.storage.saveTypesSnapshot(draft, expected);
+        if (!draft.some(t => t.id === this.plugin.settings.defaultTypeId)) {
+          this.plugin.settings.defaultTypeId = draft[0]?.id ?? "general"; await this.plugin.saveSettings();
+        }
+        this.close();
+      } catch (error) { new Notice(`${String(error)}。面板中的草稿仍保留。`); }
+      finally { controls.forEach(control => { control.disabled = false; }); }
+    };
 
     render();
   }

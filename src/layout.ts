@@ -146,6 +146,7 @@ export interface MarginLayout {
   items: LayoutItem[];
   surface: MarginSurface;
   updateAnchors: (placed: Array<{ entry: GlossEntry; el: HTMLElement; type: GlossType }>) => void;
+  observeCard: (card: HTMLElement, previous?: HTMLElement) => void;
   dispose: () => void;
 }
 
@@ -241,7 +242,7 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
     svg.style.pointerEvents = "none";
     svg.replaceChildren();
     for (const it of list) {
-      if (!it.cardEl) continue;
+      if (!it.cardEl || !it.active) continue;
       const y1 = it.hlTop + it.hlH / 2;
       const x1 = it.side === "left" ? it.hlLeft : it.hlRight;
       const y2 = it.cardTop + it.cardH / 2;
@@ -275,9 +276,18 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
       }, 80);
     });
     for (const it of items) if (it.cardEl) ro.observe(it.cardEl);
+    ro.observe(surface.host);
+    if (surface.host.parentElement) ro.observe(surface.host.parentElement);
   }
 
+  const io = typeof IntersectionObserver !== "undefined" ? new IntersectionObserver(entries => {
+    for (const entry of entries) entry.target.classList.toggle("gloss-flow-paused", !entry.isIntersecting);
+  }, { root: surface.host?.parentElement ?? null, rootMargin: "80px" }) : null;
+  const observeCard = (card: HTMLElement, previous?: HTMLElement) => { if (previous) { ro?.unobserve(previous); io?.unobserve(previous); } ro?.observe(card); io?.observe(card); };
+  for (const item of items) if (item.cardEl) observeCard(item.cardEl);
+
   return {
+    observeCard,
     items,
     surface,
     updateAnchors: (placed) => {
@@ -300,11 +310,12 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
         items.push({ entry: p.entry, type: p.type, hlEl: p.el,
           side: (rect.left + rect.right) / 2 - surface.hostLeft() < surface.width() / 2 ? "left" : "right",
           hlTop: 0, hlH: 0, hlLeft: 0, hlRight: 0, cardEl: card, cardTop: 0, cardH: 0, active: true });
-        ro?.observe(card);
+        observeCard(card);
       }
       apply();
     },
     dispose: () => {
+      io?.disconnect();
       if (ro) ro.disconnect();
       if (roTimer) clearTimeout(roTimer);
       for (const it of items) if (it.cardEl) disposeCompsUnder(it.cardEl);

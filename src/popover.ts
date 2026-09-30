@@ -38,7 +38,7 @@ export class SelectionPill {
 
   private ensure(): void {
     if (this.el) return;
-    const el = document.body.createDiv({ cls: "gloss-pill" });
+    const el = document.body.createEl("button", { cls: "gloss-pill", attr: { "aria-label": "为选中文字添加批注" } });
     el.setText("💬 批注");
     this.el = el;
   }
@@ -112,6 +112,7 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   cancel.onclick = dismiss;
   save.onclick = () => {
     save.disabled = true;
+    cancel.disabled = close.disabled = true;
     save.setText("正在保存…");
     composer.freeze(true);
 
@@ -126,6 +127,7 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
         new Notice(`批注保存失败：${errMsg(error)}。内容仍保留在窗口中，请重试。`);
       } finally {
         save.disabled = false;
+        cancel.disabled = close.disabled = false;
         save.setText("保存批注");
         composer.freeze(false);
 
@@ -211,15 +213,23 @@ export class GlossBubble {
       const currentType = plugin.storage.typeOf(entry.note.typeId);
       applyCardStyle(b, plugin.settings, currentType);
       bodyWrap.appendChild(buildCard(plugin, entry, currentType, plugin.storage.currentPath(store) ?? docPath, {
-        onChanged: () => {
-          if (!plugin.storage.saveStore(store)) return;
+        onChanged: async (next, expected) => {
+          await plugin.storage.commitEntry(store, entry.note.id, { ...entry, note: next }, expected);
           const path = plugin.storage.currentPath(store) ?? docPath;
-          if (this.el === b && b.isConnected) renderCard();
-          plugin.refreshDoc(path);
+          window.requestAnimationFrame(() => {
+            if (!plugin.isAlive || this.el !== b || !b.isConnected) return;
+            const scroll = bodyWrap.querySelector<HTMLElement>(".gloss-card-scroll");
+            const top = scroll?.scrollTop ?? 0;
+            const focused = bodyWrap.contains(document.activeElement);
+            renderCard();
+            const nextScroll = bodyWrap.querySelector<HTMLElement>(".gloss-card-scroll"); if (nextScroll) nextScroll.scrollTop = top;
+            if (focused) bodyWrap.querySelector<HTMLTextAreaElement>(".gloss-reply-ta")?.focus({ preventScroll: true });
+          });
+          plugin.refreshCard(entry, store);
         },
-        onDeleted: () => {
+        onDeleted: async () => {
+          await plugin.deleteAnnotation(store, entry.note.id);
           this.close();
-          void plugin.deleteAnnotation(store, entry.note.id);
         },
       }));
     };
