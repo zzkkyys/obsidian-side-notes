@@ -19,7 +19,7 @@ export class PdfGloss {
     this.scanTimer = setTimeout(() => { this.scanTimer = null; this.scan(); }, 400);
   }
   /** contentEl → 清理函数 + 视图引用（视图关闭 / 插件卸载时释放观察器与事件） */
-  private inited = new Map<HTMLElement, { cleanup: () => void; view: PdfViewLike }>();
+  private inited = new Map<HTMLElement, { cleanup: () => void; view: PdfViewLike; document: Document }>();
 
   constructor(private plugin: GlossPlugin) {}
 
@@ -37,7 +37,7 @@ export class PdfGloss {
     if (!this.plugin.settings.pdfEnabled || !this.plugin.isAlive) return;
     // 回收已关闭视图的观察器 / 事件（contentEl 脱离文档）
     for (const [el, rec] of [...this.inited]) {
-      if (!document.body.contains(el)) {
+      if (!el.isConnected || el.ownerDocument !== rec.document) {
         rec.cleanup();
         this.inited.delete(el);
         rec.view.__glossInit = false;
@@ -89,6 +89,8 @@ export class PdfGloss {
   private init(view: PdfViewLike): void {
     view.__glossInit = true;
     const contentEl = view.contentEl;
+    const doc = contentEl.ownerDocument;
+    const win = doc.defaultView ?? window;
     const plugin = this.plugin;
     const cleanups: Array<() => void> = [];
 
@@ -124,7 +126,7 @@ export class PdfGloss {
         // 等待期间视图可能已被回收（close/setPdfEnabled(false)/插件卸载）：
         // 不核对 disposed 的话，loadDoc 之后仍会把色块写回已清空的 DOM
         if (disposed || token !== renderToken || !plugin.isAlive || !plugin.settings.pdfEnabled
-          || !document.body.contains(contentEl) || view.file?.path !== file.path) return;
+          || !contentEl.isConnected || contentEl.ownerDocument !== doc || view.file?.path !== file.path) return;
         contentEl.querySelectorAll<HTMLElement>(".gloss-pdf-hl").forEach((n) => n.remove());
         for (const e of store.entries) {
           if (e.anchor.kind !== "pdf" || !e.anchor.bbox) continue;
@@ -213,14 +215,14 @@ export class PdfGloss {
       selBox.style.width = `${Math.max(0, x1 - x0)}px`;
       selBox.style.height = `${Math.max(0, y1 - y0)}px`;
     };
-    const pill = new SelectionPill();
+    const pill = new SelectionPill(doc);
     const updateSelection = () => {
       pill.hide();
       if (disposed || !plugin.isAlive) return;
-        const selection = window.getSelection();
+        const selection = win.getSelection();
         if (!selection || selection.isCollapsed || !selection.rangeCount || !view.file) return;
         const range = selection.getRangeAt(0);
-        const pageFor = (node: Node) => (node instanceof Element ? node : node.parentElement)?.closest<HTMLElement>(".page[data-page-number]");
+        const pageFor = (node: Node) => (node.nodeType === 1 ? node as Element : node.parentElement)?.closest<HTMLElement>(".page[data-page-number]");
         const pageEl = pageFor(range.startContainer);
         if (!pageEl || !contentEl.contains(pageEl) || pageEl !== pageFor(range.endContainer)) return;
         const cv = pageEl.querySelector<HTMLCanvasElement>("canvas");
@@ -238,12 +240,12 @@ export class PdfGloss {
         button.onmousedown = event => event.preventDefault();
         button.onclick = () => {
           if (disposed || !plugin.isAlive || view.file?.path !== docPath) return;
-          pill.hide(); plugin.openPdfCreatePopover(docPath, anchor, rect);
+          pill.hide(); plugin.openPdfCreatePopover(docPath, anchor, rect, doc);
         };
         pill.show(rect);
     };
-    document.addEventListener("selectionchange", updateSelection);
-    cleanups.push(() => { document.removeEventListener("selectionchange", updateSelection); pill.dispose(); });
+    doc.addEventListener("selectionchange", updateSelection);
+    cleanups.push(() => { doc.removeEventListener("selectionchange", updateSelection); pill.dispose(); });
     const onUp = (e: MouseEvent) => {
       if (!dragging) return; // 原生选区仅显示浮泡，由点击明确创建。
       dragging = false;
@@ -301,23 +303,23 @@ export class PdfGloss {
           }
         } catch { /* 无文本层则仅区域锚点 */ }
         // 文本抽取是异步的：期间视图可能已切走，不能再用旧视图弹浮层
-        if (!plugin.isAlive || !document.body.contains(contentEl) || view.file?.path !== file.path) return;
-        plugin.openPdfCreatePopover(file.path, anchor, rect);
+        if (disposed || !plugin.isAlive || !plugin.settings.pdfEnabled || !contentEl.isConnected || contentEl.ownerDocument !== doc || view.file?.path !== file.path) return;
+        plugin.openPdfCreatePopover(file.path, anchor, rect, doc);
       })();
     };
 
     contentEl.addEventListener("mousedown", onDown, true);
     cleanups.push(() => contentEl.removeEventListener("mousedown", onDown, true));
     // document 级监听不用 registerDomEvent（要随视图提前释放，而它只随卸载释放）
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
+    doc.addEventListener("mousemove", onMove);
+    doc.addEventListener("mouseup", onUp);
     cleanups.push(() => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
+      doc.removeEventListener("mousemove", onMove);
+      doc.removeEventListener("mouseup", onUp);
     });
 
     this.inited.set(contentEl, {
-      view,
+      view, document: doc,
       cleanup: () => {
         // 先关门闩、作废在途渲染令牌，再拆监听——顺序保证清理后到手的异步渲染直接返回
         disposed = true;

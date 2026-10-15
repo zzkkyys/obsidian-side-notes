@@ -80,13 +80,13 @@ class SurfaceImpl implements MarginSurface {
 
   availableWidth(): number {
     const viewport = this.scrollAdjusted ? this.host : this.host.parentElement ?? this.host;
-    const css = getComputedStyle(viewport);
+    const css = (viewport.ownerDocument.defaultView ?? window).getComputedStyle(viewport);
     return viewport.clientWidth - (parseFloat(css.paddingLeft) || 0) - (parseFloat(css.paddingRight) || 0);
   }
 
   readingWidth(): number {
     const content = this.gutterEl ?? this.host;
-    const css = getComputedStyle(content);
+    const css = (content.ownerDocument.defaultView ?? window).getComputedStyle(content);
     const textWidth = content.clientWidth - (parseFloat(css.paddingLeft) || 0) - (parseFloat(css.paddingRight) || 0);
     return Math.max(480, Math.min(700, textWidth));
   }
@@ -230,7 +230,7 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
   function drawConnectors(s: MarginSurface, list: LayoutItem[], W2: number) {
     let svg = s.layer.querySelector<SVGSVGElement>("svg.gloss-connectors");
     if (!svg) {
-      svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg = s.layer.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
       svg.classList.add("gloss-connectors");
       s.layer.appendChild(svg);
     }
@@ -250,7 +250,7 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
       const c = Math.max(24, Math.abs(x2 - x1) * 0.45);
       const cx1 = it.side === "left" ? x1 + c : x1 - c;
       const cx2 = it.side === "left" ? x2 - c : x2 + c;
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      const path = s.layer.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${cx1.toFixed(1)} ${y1.toFixed(1)}, ${cx2.toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`);
       path.setAttribute("stroke", /^#[\da-f]{3}([\da-f]{3})?$/i.test(it.type.color) ? it.type.color : "#8a8f98");
       path.setAttribute("stroke-width", "1.5");
@@ -271,7 +271,7 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
       if (roTimer) return;
       roTimer = setTimeout(() => {
         roTimer = null;
-        if (!document.body.contains(layer)) return;
+        if (!layer.isConnected) return;
         apply();
       }, 80);
     });

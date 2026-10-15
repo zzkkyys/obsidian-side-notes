@@ -10,11 +10,13 @@ import { clamp, uuid } from "./util";
 
 export class SelectionPill {
   private el: HTMLElement | null = null;
+  constructor(private doc: Document = document) {}
 
   show(rect: DOMRect): void {
     this.ensure();
     const el = this.el!;
-    const x = clamp(rect.left + rect.width / 2, 80, window.innerWidth - 80);
+    const win = this.doc.defaultView ?? window;
+    const x = clamp(rect.left + rect.width / 2, 80, win.innerWidth - 80);
     const y = Math.max(10, rect.top - 40);
     el.style.left = `${x}px`;
     el.style.top = `${y}px`;
@@ -38,7 +40,7 @@ export class SelectionPill {
 
   private ensure(): void {
     if (this.el) return;
-    const el = document.body.createEl("button", { cls: "gloss-pill", attr: { "aria-label": "为选中文字添加批注" } });
+    const el = this.doc.body.createEl("button", { cls: "gloss-pill", attr: { "aria-label": "为选中文字添加批注" } });
     el.setText("💬 批注");
     this.el = el;
   }
@@ -51,9 +53,11 @@ export interface CreatePopoverOptions {
   anchor: Anchor;
   rect: DOMRect;
   onClosed: () => void;
+  document?: Document;
 }
 
 const createClosers = new WeakMap<HTMLElement, () => void>();
+const activeCreates = new WeakMap<GlossPlugin, Set<() => void>>();
 export function dismissCreatePopover(el: HTMLElement): void {
   const close = createClosers.get(el);
   if (close) close();
@@ -63,7 +67,8 @@ export function dismissCreatePopover(el: HTMLElement): void {
 /** 返回浮层根元素（调用方持有，文档重命名等场景可程序化关闭） */
 export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOptions): HTMLElement {
   GlossBubble.close();
-  const pop = document.body.createDiv({ cls: "gloss-create" });
+  const doc = opts.document ?? document;
+  const pop = doc.body.createDiv({ cls: "gloss-create" });
 
   const head = pop.createDiv({ cls: "gloss-create-head" });
   head.createSpan({ cls: "gloss-create-title", text: "新建批注" });
@@ -71,13 +76,22 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   let disposeEditor = () => {};
   let cleanupEvents = () => {};
   let dismissed = false;
+  let closers = activeCreates.get(plugin);
+  if (!closers) {
+    closers = new Set();
+    activeCreates.set(plugin, closers);
+    const active = closers;
+    plugin.register(() => { for (const close of [...active]) close(); });
+  }
   const dismiss = () => {
     if (dismissed) return;
     dismissed = true; cleanupEvents();
     createClosers.delete(pop);
+    closers!.delete(dismiss);
     disposeEditor(); pop.remove(); opts.onClosed();
   };
   createClosers.set(pop, dismiss);
+  closers.add(dismiss);
   close.onclick = dismiss;
 
   pop.createDiv({ cls: "gloss-card-quote", text: opts.anchor.text || "所选区域" });
@@ -111,6 +125,7 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   const save = btnRow.createEl("button", { cls: "gloss-primary", text: "保存批注" });
   cancel.onclick = dismiss;
   save.onclick = () => {
+    if (!plugin.isAlive || dismissed) return;
     save.disabled = true;
     cancel.disabled = close.disabled = true;
     save.setText("正在保存…");
@@ -119,10 +134,11 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
     void (async () => {
       try {
         await composer.ready();
-        if (!pop.isConnected) return; // 等待期间弹窗已被关掉
+        if (!plugin.isAlive || !pop.isConnected) return; // 等待期间弹窗已关闭或插件已卸载
         await plugin.createAnnotation(opts.docPath, opts.anchor, typeId, ta.value.trim(), attachments, noteId);
+        if (!plugin.isAlive || !pop.isConnected) return;
         dismiss();
-        plugin.revealAnnotation(opts.docPath, noteId, opts.rect);
+        plugin.revealAnnotation(opts.docPath, noteId, opts.rect, doc);
       } catch (error) {
         new Notice(`批注保存失败：${errMsg(error)}。内容仍保留在窗口中，请重试。`);
       } finally {
@@ -140,7 +156,7 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   };
   positionPopover(pop, opts.rect);
   const onKey = (event: KeyboardEvent) => {
-    if (event.key !== "Escape" || document.querySelector(".gloss-image-viewer")) return;
+    if (event.key !== "Escape" || doc.querySelector(".gloss-image-viewer")) return;
     event.preventDefault(); event.stopPropagation();
     if (!ta.value.trim() && attachments.length === 0 && !composer.hasPending() && !save.disabled) dismiss();
   };
@@ -152,25 +168,26 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   const timer = setTimeout(() => {
     if (!pop.isConnected) return;
     ta.focus();
-    document.addEventListener("keydown", onKey, true);
-    document.addEventListener("mousedown", onOutside, true);
+    doc.addEventListener("keydown", onKey, true);
+    doc.addEventListener("mousedown", onOutside, true);
   }, 0);
   cleanupEvents = () => {
     clearTimeout(timer);
-    document.removeEventListener("keydown", onKey, true);
-    document.removeEventListener("mousedown", onOutside, true);
+    doc.removeEventListener("keydown", onKey, true);
+    doc.removeEventListener("mousedown", onOutside, true);
   };
   return pop;
 }
 
 function positionPopover(pop: HTMLElement, rect: DOMRect): void {
-  const W = Math.min(480, window.innerWidth - 16);
+  const win = pop.ownerDocument.defaultView ?? window;
+  const W = Math.min(480, win.innerWidth - 16);
   pop.style.width = `${W}px`;
-  pop.style.left = `${clamp(rect.left + rect.width / 2 - W / 2, 8, window.innerWidth - W - 8)}px`;
+  pop.style.left = `${clamp(rect.left + rect.width / 2 - W / 2, 8, win.innerWidth - W - 8)}px`;
   pop.style.top = "0px";
   const h = pop.offsetHeight;
   let y = rect.bottom + 10;
-  if (y + h > window.innerHeight - 8) y = Math.max(8, rect.top - h - 10);
+  if (y + h > win.innerHeight - 8) y = Math.max(8, rect.top - h - 10);
   pop.style.top = `${y}px`;
 }
 
@@ -181,6 +198,10 @@ export class GlossBubble {
   private static cleanup: (() => void) | null = null;
   /** 气泡当前展示的文档路径（文档重命名时据此判断是否要关掉气泡） */
   static docPath: string | null = null;
+
+  static closeForDocument(doc: Document): void {
+    if (this.el?.ownerDocument === doc) this.close();
+  }
 
   static close(): void {
     this.cleanup?.();
@@ -195,11 +216,14 @@ export class GlossBubble {
 
   }
 
-  static show(plugin: GlossPlugin, entry: GlossEntry, type: GlossType, anchorEl: HTMLElement | DOMRect, store: GlossDocStore): void {
+  static show(plugin: GlossPlugin, entry: GlossEntry, type: GlossType, anchorEl: HTMLElement | DOMRect, store: GlossDocStore, ownerDocument?: Document): void {
+    if (!plugin.isAlive) return;
     this.close();
+    const doc = ownerDocument ?? ("ownerDocument" in anchorEl ? anchorEl.ownerDocument : document);
+    const win = doc.defaultView ?? window;
     const docPath = store.docPath;
     this.docPath = docPath;
-    const b = document.body.createDiv({ cls: "gloss-bubble" });
+    const b = doc.body.createDiv({ cls: "gloss-bubble" });
     b.dataset.glossId = entry.note.id;
     applyCardStyle(b, plugin.settings, type);
     const head = b.createDiv({ cls: "gloss-bubble-head" });
@@ -216,11 +240,11 @@ export class GlossBubble {
         onChanged: async (next, expected) => {
           await plugin.storage.commitEntry(store, entry.note.id, { ...entry, note: next }, expected);
           const path = plugin.storage.currentPath(store) ?? docPath;
-          window.requestAnimationFrame(() => {
+          win.requestAnimationFrame(() => {
             if (!plugin.isAlive || this.el !== b || !b.isConnected) return;
             const scroll = bodyWrap.querySelector<HTMLElement>(".gloss-card-scroll");
             const top = scroll?.scrollTop ?? 0;
-            const focused = bodyWrap.contains(document.activeElement);
+            const focused = bodyWrap.contains(doc.activeElement);
             renderCard();
             const nextScroll = bodyWrap.querySelector<HTMLElement>(".gloss-card-scroll"); if (nextScroll) nextScroll.scrollTop = top;
             if (focused) bodyWrap.querySelector<HTMLTextAreaElement>(".gloss-reply-ta")?.focus({ preventScroll: true });
@@ -236,14 +260,14 @@ export class GlossBubble {
     renderCard();
 
     // 定位：优先锚点下方，空间不足上翻，水平 clamp
-    const r = anchorEl instanceof HTMLElement ? anchorEl.getBoundingClientRect() : anchorEl;
-    const W = Math.min(340, window.innerWidth - 16);
+    const r = "getBoundingClientRect" in anchorEl ? anchorEl.getBoundingClientRect() : anchorEl;
+    const W = Math.min(340, win.innerWidth - 16);
     b.style.width = `${W}px`;
-    b.style.left = `${clamp(r.left + r.width / 2 - W / 2, 8, window.innerWidth - W - 8)}px`;
+    b.style.left = `${clamp(r.left + r.width / 2 - W / 2, 8, win.innerWidth - W - 8)}px`;
     b.style.top = "0px";
     const h = b.offsetHeight;
     let y = r.bottom + 8;
-    if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 8);
+    if (y + h > win.innerHeight - 8) y = Math.max(8, r.top - h - 8);
     b.style.top = `${y}px`;
 
     this.el = b;
@@ -255,11 +279,11 @@ export class GlossBubble {
         if ((t as Element).closest?.(".gloss-hl, .gloss-type-menu, .gloss-editor-modal, .gloss-image-viewer")) return; // 点另一个高亮 → 先关再开
         this.close();
       };
-      document.addEventListener("mousedown", onDown, true);
-      document.addEventListener("touchstart", onDown, true);
+      doc.addEventListener("mousedown", onDown, true);
+      doc.addEventListener("touchstart", onDown, true);
       this.cleanup = () => {
-        document.removeEventListener("mousedown", onDown, true);
-        document.removeEventListener("touchstart", onDown, true);
+        doc.removeEventListener("mousedown", onDown, true);
+        doc.removeEventListener("touchstart", onDown, true);
       };
     }, 0);
   }

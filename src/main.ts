@@ -1,7 +1,7 @@
 import { MarkdownView, Menu, Modal, Notice, Plugin, TFile, TFolder, type EventRef } from "obsidian";
 import { applyCardStyle } from "./card-style";
 import { EditorHighlights, sourceRange } from "./editor";
-import { buildCard, disposeCompsUnder, type CardHooks } from "./card";
+import { buildCard, closeTypeMenu, disposeCompsUnder, type CardHooks } from "./card";
 import { exportDocAnnotations } from "./export";
 import { buildMarginLayout, getSurface, type MarginLayout } from "./layout";
 import { GENERIC_BLOCK_EDITOR, GENERIC_BLOCK_PREVIEW, unwrapAll, blockPlainText, locateAnchor, selectionToMdAnchor, wrapRangeInBlock } from "./anchor";
@@ -32,7 +32,8 @@ export default class GlossPlugin extends Plugin {
   storage = new GlossStorage(this);
 
   private editorHighlights = new EditorHighlights(this);
-  private pill = new SelectionPill();
+  private pills = new Map<Document, SelectionPill>();
+  private windowCleanups = new Map<Window, () => void>();
   private layoutOverride: "margin" | "bubble" | null = null;
   private renderTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private renderState = new WeakMap<HTMLElement, { sig: string; at: number }>();
@@ -171,18 +172,17 @@ export default class GlossPlugin extends Plugin {
     }));
 
     // Hidden annotation files require adapter reads; polling does not depend on undocumented events.
-    const checkExternal = () => {
-      this.storage.setActivePaths(this.app.workspace.getLeavesOfType("markdown").concat(this.app.workspace.getLeavesOfType("pdf"))
-        .map(leaf => (leaf.view as { file?: TFile }).file?.path).filter((p): p is string => !!p));
-      void this.storage.checkExternalChanges().then(changed => {
-      if (changed && this.alive) this.refreshAll();
-    }); };
-    this.registerInterval(window.setInterval(checkExternal, 5000));
-    this.registerDomEvent(window, "focus", checkExternal);
+    this.registerInterval(window.setInterval(() => this.checkExternal(), 5000));
 
-    // ---- 视口 / 选区 ----
-    const onResize = debounce(() => this.scheduleAll(), 200);
-    this.registerDomEvent(window, "resize", onResize);
+    // Each Obsidian window owns its selection, viewport, and popup DOM.
+    this.watchWindow(window);
+    this.registerEvent(this.app.workspace.on("window-open", (_container, win) => this.watchWindow(win)));
+    this.registerEvent(this.app.workspace.on("window-close", (_container, win) => {
+      this.windowCleanups.get(win)?.();
+      GlossBubble.closeForDocument(win.document);
+      closeTypeMenu(win.document);
+      if (this.createPop?.el.ownerDocument === win.document) this.closeCreatePopover();
+    }));
     this.registerEvent(this.app.workspace.on("css-change", () => {
       for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
         if (!(leaf.view instanceof MarkdownView)) continue;
@@ -190,11 +190,6 @@ export default class GlossPlugin extends Plugin {
       }
       this.scheduleAll();
     }));
-
-    this.registerDomEvent(document, "selectionchange", () => this.updatePill());
-    this.registerDomEvent(window, "scroll", () => this.pill.hide(), true);
-    this.registerDomEvent(this.pill.ensureEl(), "mousedown", (event) => event.preventDefault());
-    this.registerDomEvent(this.pill.ensureEl(), "click", () => void this.cmdCreate());
 
     // ---- 右键菜单（编辑器：源码/实时预览；阅读视图走选区浮泡） ----
     this.registerEvent(this.app.workspace.on("editor-menu", (menu: Menu, editor) => {
@@ -226,11 +221,20 @@ export default class GlossPlugin extends Plugin {
     this.pdf = new PdfGloss(this);
     this.pdf.start();
 
-    this.app.workspace.onLayoutReady(() => this.scheduleAll());
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.alive) return;
+      for (const leaf of this.app.workspace.getLeavesOfType("markdown").concat(this.app.workspace.getLeavesOfType("pdf"))) {
+        const win = leaf.view.containerEl.ownerDocument.defaultView;
+        if (win) this.watchWindow(win);
+      }
+      this.scheduleAll();
+    });
   }
 
   async onunload(): Promise<void> {
     this.alive = false;
+    this.closeCreatePopover();
+    closeTypeMenu();
     this.storage.onStatusChange = () => {};
     const flushed = this.storage.flushAll();
     shutdowns.set(this.app.vault, flushed);
@@ -258,6 +262,8 @@ export default class GlossPlugin extends Plugin {
       const v = leaf.view;
       if (!(v instanceof MarkdownView)) continue;
       const ce = v.contentEl;
+      unwrapAll(ce);
+      ce.querySelectorAll(".gloss-margin-layer").forEach(el => el.remove());
       // getSurface 的 host 候选（含回退到 contentEl 本身）
       for (const h of [
         ce.querySelector<HTMLElement>(".cm-scroller"),
@@ -273,9 +279,48 @@ export default class GlossPlugin extends Plugin {
         }
       }
     }
-    this.pill.dispose();
+    for (const cleanup of [...this.windowCleanups.values()]) cleanup();
     GlossBubble.close();
     await flushed;
+  }
+
+  private checkExternal(): void {
+    if (!this.alive) return;
+    this.storage.setActivePaths(this.app.workspace.getLeavesOfType("markdown").concat(this.app.workspace.getLeavesOfType("pdf"))
+      .map(leaf => (leaf.view as { file?: TFile }).file?.path).filter((path): path is string => !!path));
+    void this.storage.checkExternalChanges().then(changed => { if (changed && this.alive) this.refreshAll(); });
+  }
+
+  private watchWindow(win: Window): void {
+    if (!this.alive || this.windowCleanups.has(win)) return;
+    const doc = win.document;
+    const pill = new SelectionPill(doc);
+    this.pills.set(doc, pill);
+    const button = pill.ensureEl();
+    const resize = debounce(() => this.scheduleAll(), 200);
+    const selection = () => this.updatePill(doc);
+    const scroll = () => pill.hide();
+    const focus = () => this.checkExternal();
+    const down = (event: MouseEvent) => event.preventDefault();
+    const click = () => void this.cmdCreate();
+    win.addEventListener("resize", resize);
+    win.addEventListener("focus", focus);
+    win.addEventListener("scroll", scroll, true);
+    doc.addEventListener("selectionchange", selection);
+    button.addEventListener("mousedown", down);
+    button.addEventListener("click", click);
+    this.windowCleanups.set(win, () => {
+      resize.cancel();
+      win.removeEventListener("resize", resize);
+      win.removeEventListener("focus", focus);
+      win.removeEventListener("scroll", scroll, true);
+      doc.removeEventListener("selectionchange", selection);
+      button.removeEventListener("mousedown", down);
+      button.removeEventListener("click", click);
+      pill.dispose();
+      this.pills.delete(doc);
+      this.windowCleanups.delete(win);
+    });
   }
 
   /** 注册 d.ts 中缺少类型重载的 workspace 事件（运行时均存在） */
@@ -300,7 +345,7 @@ export default class GlossPlugin extends Plugin {
 
   /** Style changes do not rebuild cards or disturb drafts/focus. */
   updateCardStyles(): void {
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>(".gloss-card[data-gloss-type], .gloss-bubble[data-gloss-type]"))) {
+    for (const doc of this.pills.keys()) for (const el of Array.from(doc.querySelectorAll<HTMLElement>(".gloss-card[data-gloss-type], .gloss-bubble[data-gloss-type]"))) {
       applyCardStyle(el, this.settings, this.storage.typeOf(el.dataset.glossType!));
     }
   }
@@ -326,7 +371,7 @@ export default class GlossPlugin extends Plugin {
     }
     // 回收已脱离文档的布局（卡片 Component / ResizeObserver）
     for (const [host, layout] of [...this.layoutMap]) {
-      if (!document.body.contains(host)) {
+      if (!host.isConnected) {
         layout.dispose();
         this.layoutMap.delete(host);
       }
@@ -377,7 +422,7 @@ export default class GlossPlugin extends Plugin {
       f?.stat?.size ?? 0,
       this.versionCounter.get(f?.path ?? "") ?? 0,
       mode,
-      window.innerWidth,
+      (view.contentEl.ownerDocument.defaultView ?? window).innerWidth,
       view.contentEl.clientWidth,
       this.layoutOverride ?? this.settings.layoutMode,
       this.settings.highlightStyle,
@@ -390,6 +435,7 @@ export default class GlossPlugin extends Plugin {
     if (!this.alive) return;
     const file = view.file;
     if (!file || !view.contentEl.isConnected || view.contentEl.clientWidth === 0) return;
+    this.watchWindow(view.contentEl.ownerDocument.defaultView ?? window);
     // 每次渲染都先作废旧渲染（令牌）
     const seq = (this.renderSeq.get(view.contentEl) ?? 0) + 1;
     this.renderSeq.set(view.contentEl, seq);
@@ -435,7 +481,7 @@ export default class GlossPlugin extends Plugin {
     const store = await this.storage.loadDoc(file.path);
     if (this.renderSeq.get(view.contentEl) !== seq) return; // 期间已有更新渲染，丢弃本次
     // 身份校验：await 期间视图可能已切走/卸载，旧视图的 contentEl 已被 Obsidian 复用
-    if (!this.alive || view.file?.path !== file.path || !document.body.contains(view.contentEl)) return;
+    if (!this.alive || view.file?.path !== file.path || !view.contentEl.isConnected) return;
     // 先卸载旧布局中的 Component，再构造新的 Surface。
     const prev = this.layoutMap.get(view.contentEl);
     const reuse = !force && prev?.surface.layer.isConnected && view.contentEl.contains(prev.surface.host)
@@ -455,7 +501,7 @@ export default class GlossPlugin extends Plugin {
     if (!this.readingObservers.has(surface.host)) {
       const observer = new MutationObserver(records => {
         const changed = records.some(record => [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].some(node =>
-          node instanceof HTMLElement && !node.classList.contains("gloss-margin-layer") && !node.classList.contains("gloss-connectors")));
+          node.nodeType === 1 && !(node as Element).classList.contains("gloss-margin-layer") && !(node as Element).classList.contains("gloss-connectors")));
         const path = view.file?.path;
         if (changed && this.alive && path) {
           // Virtualized blocks changed, not annotation data: permit reanchoring but retain card DOM.
@@ -492,7 +538,7 @@ export default class GlossPlugin extends Plugin {
       // 布局判定：手动命令覆盖 > 设置项（auto 时按断点宽度）
       const forced: "margin" | "bubble" | null = this.layoutOverride
         ?? (this.settings.layoutMode === "auto" ? null : this.settings.layoutMode);
-      const want: "margin" | "bubble" = forced ?? (window.innerWidth >= this.settings.wideBreakpoint ? "margin" : "bubble");
+      const want: "margin" | "bubble" = forced ?? ((view.contentEl.ownerDocument.defaultView ?? window).innerWidth >= this.settings.wideBreakpoint ? "margin" : "bubble");
       const gutter = Math.max(248, this.settings.marginWidth) + 24;
       const canMargin = surface.availableWidth() >= surface.readingWidth() + 2 * gutter;
 
@@ -609,16 +655,16 @@ export default class GlossPlugin extends Plugin {
     return view instanceof MarkdownView ? view : null;
   }
 
-  private updatePill(): void {
-    if (this.popoverOpen || window.getSelection()?.isCollapsed) { this.pill.hide(); return; }
+  private updatePill(doc: Document): void {
+    const pill = this.pills.get(doc);
+    if (!pill) return;
+    const selection = doc.getSelection();
+    if (this.popoverOpen || !selection || selection.isCollapsed) { pill.hide(); return; }
     const view = this.activeMarkdownView();
-    if (!view || !view.file) { this.pill.hide(); return; }
+    if (!view?.file || view.contentEl.ownerDocument !== doc) { pill.hide(); return; }
     const sel = this.currentSelection();
-    if (sel && view.contentEl.contains(window.getSelection()?.anchorNode ?? document.body)) {
-      this.pill.show(sel.rect);
-    } else {
-      this.pill.hide();
-    }
+    if (sel && view.contentEl.contains(selection.anchorNode)) pill.show(sel.rect);
+    else pill.hide();
   }
 
   private currentSelection(): { anchor: Anchor; rect: DOMRect } | null {
@@ -636,7 +682,7 @@ export default class GlossPlugin extends Plugin {
     }
     const mode = mdViewMode(view);
     if (mode !== "preview") return this.editorSelectionAnchor(view);
-    return selectionToMdAnchor(GENERIC_BLOCK_PREVIEW);
+    return selectionToMdAnchor(GENERIC_BLOCK_PREVIEW, view.contentEl.ownerDocument);
   }
 
   // ================= 建 / 删批注 =================
@@ -649,6 +695,7 @@ export default class GlossPlugin extends Plugin {
     attachments: GlossAttachment[],
     noteId?: string,
   ): Promise<void> {
+    if (!this.alive) throw new Error("Gloss 已卸载，无法保存批注");
     const now = Date.now();
     const entry: GlossEntry = {
       anchor,
@@ -682,24 +729,25 @@ export default class GlossPlugin extends Plugin {
   refreshCard(entry: GlossEntry, store: GlossDocStore): void {
     const path = this.storage.currentPath(store) ?? store.docPath;
     this.editorHighlights.refresh(path); this.pdf?.refresh(path);
-    window.requestAnimationFrame(() => {
-      if (!this.alive) return;
-      for (const layout of this.layoutMap.values()) for (const item of layout.items) {
-        if (item.entry !== entry || !item.cardEl) continue;
-        const old = item.cardEl;
-        const active = old.contains(document.activeElement) ? document.activeElement as HTMLTextAreaElement : null;
+    for (const layout of this.layoutMap.values()) for (const item of layout.items) {
+      if (item.entry !== entry || !item.cardEl) continue;
+      const old = item.cardEl;
+      const win = old.ownerDocument.defaultView;
+      win?.requestAnimationFrame(() => {
+        if (!this.alive || !old.isConnected || item.cardEl !== old) return;
+        const active = old.contains(old.ownerDocument.activeElement) ? old.ownerDocument.activeElement as HTMLTextAreaElement : null;
         const scrollTop = old.querySelector<HTMLElement>(".gloss-card-scroll")?.scrollTop ?? 0;
         const card = buildCard(this, entry, this.storage.typeOf(entry.note.typeId), path, {
           onChanged: async (next, expected) => { await this.storage.commitEntry(store, entry.note.id, { ...entry, note: next }, expected); this.refreshCard(entry, store); },
           onDeleted: () => this.deleteAnnotation(store, entry.note.id),
+        });
+        card.style.cssText = old.style.cssText;
+        applyCardStyle(card, this.settings, this.storage.typeOf(entry.note.typeId));
+        disposeCompsUnder(old); old.replaceWith(card); item.cardEl = card; layout.observeCard(card, old); item.type = this.storage.typeOf(entry.note.typeId);
+        const scroll = card.querySelector<HTMLElement>(".gloss-card-scroll"); if (scroll) scroll.scrollTop = scrollTop;
+        if (active?.classList.contains("gloss-reply-ta")) card.querySelector<HTMLTextAreaElement>(".gloss-reply-ta")?.focus({ preventScroll: true });
       });
-      card.style.cssText = old.style.cssText;
-      applyCardStyle(card, this.settings, this.storage.typeOf(entry.note.typeId));
-      disposeCompsUnder(old); old.replaceWith(card); item.cardEl = card; layout.observeCard(card, old); item.type = this.storage.typeOf(entry.note.typeId);
-      const scroll = card.querySelector<HTMLElement>(".gloss-card-scroll"); if (scroll) scroll.scrollTop = scrollTop;
-      if (active?.classList.contains("gloss-reply-ta")) card.querySelector<HTMLTextAreaElement>(".gloss-reply-ta")?.focus({ preventScroll: true });
     }
-    });
   }
 
   /** 程序化关闭新建批注浮层（文档重命名时调用） */
@@ -715,6 +763,8 @@ export default class GlossPlugin extends Plugin {
 
   /** 命令 / 浮泡 / 右键共用入口 */
   async cmdCreate(): Promise<void> {
+    if (!this.alive) return;
+    if (this.createPop?.el.isConnected) { this.createPop.el.querySelector("textarea")?.focus(); return; }
     const view = this.activeMarkdownView();
     if (!view || !view.file) {
       new Notice("请先打开一篇 Markdown 文档");
@@ -726,9 +776,10 @@ export default class GlossPlugin extends Plugin {
       return;
     }
     this.popoverOpen = true;
-    this.pill.hide();
+    for (const pill of this.pills.values()) pill.hide();
     const el = openCreatePopover(this, {
       docPath: view.file.path,
+      document: view.contentEl.ownerDocument,
       anchor: sel.anchor,
       rect: sel.rect,
       onClosed: () => {
@@ -745,10 +796,13 @@ export default class GlossPlugin extends Plugin {
   }
 
   /** PDF 场景的创建入口（pdf.ts 调用） */
-  openPdfCreatePopover(docPath: string, anchor: Anchor, rect: DOMRect): void {
+  openPdfCreatePopover(docPath: string, anchor: Anchor, rect: DOMRect, doc: Document = document): void {
+    if (!this.alive) return;
+    if (this.createPop?.el.isConnected) { this.createPop.el.querySelector("textarea")?.focus(); return; }
     this.popoverOpen = true;
     const el = openCreatePopover(this, {
       docPath,
+      document: doc,
       anchor,
       rect,
       onClosed: () => {
@@ -778,26 +832,28 @@ export default class GlossPlugin extends Plugin {
     const lineEnd = endLine < 0 ? raw.length : endLine;
     const prefix = sourceToRenderedApprox(raw.slice(lineStart, from));
     const text = sourceToRenderedApprox(selected) || selected;
-    const dom = selectionToMdAnchor(GENERIC_BLOCK_EDITOR);
+    const dom = selectionToMdAnchor(GENERIC_BLOCK_EDITOR, view.contentEl.ownerDocument);
     const anchor: MdAnchor = {
       kind: "md", blockId: "", start: prefix.length, end: prefix.length + text.length, text,
       blockText: sourceToRenderedApprox(raw.slice(lineStart, lineEnd)),
       prefix: prefix.slice(-48), suffix: sourceToRenderedApprox(raw.slice(to, lineEnd)).slice(0, 48),
     };
     anchor.source = { from, to, text: selected, prefix: raw.slice(Math.max(0, from - 48), from), suffix: raw.slice(to, to + 48) };
-    return { anchor, rect: dom?.rect ?? new DOMRect(window.innerWidth / 2 - 100, window.innerHeight / 2 - 16, 200, 20) };
+    const win = view.contentEl.ownerDocument.defaultView ?? window;
+    return { anchor, rect: dom?.rect ?? new DOMRect(win.innerWidth / 2 - 100, win.innerHeight / 2 - 16, 200, 20) };
   }
 
   /** 保存后显示刚创建的条目，即使当前没有足够页边空间。 */
-  revealAnnotation(path: string, id: string, rect: DOMRect): void {
-    const view = this.mdViewFor(path);
+  revealAnnotation(path: string, id: string, rect: DOMRect, doc: Document = document): void {
+    if (!this.alive) return;
+    const view = this.mdViewsFor(path).find(view => view.contentEl.ownerDocument === doc);
     const store = this.storage.docCacheFor(path);
     const entry = store?.entries.find(e => e.note.id === id);
     if (!store || !entry) return;
     const card = Array.from(view?.contentEl.querySelectorAll<HTMLElement>(".gloss-card") ?? []).find(el => el.dataset.glossId === id);
     if (card) { card.scrollIntoView({ block: "nearest" }); return; }
     const hl = Array.from(view?.contentEl.querySelectorAll<HTMLElement>(".gloss-hl") ?? []).find(el => el.dataset.glossId === id);
-    GlossBubble.show(this, entry, this.storage.typeOf(entry.note.typeId), hl ?? rect, store);
+    GlossBubble.show(this, entry, this.storage.typeOf(entry.note.typeId), hl ?? rect, store, doc);
   }
 
   // ================= 其它命令 =================

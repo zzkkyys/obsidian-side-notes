@@ -8,7 +8,8 @@ test('virtualized block replacement retains cards and drafts, creating only newl
   let builds = 0, disposals = 0;
   const element = () => ({ style: {}, classList: { add() {}, toggle() {} }, offsetHeight: 80, setAttribute() {}, replaceChildren() {}, appendChild() {} });
   const children = [];
-  const layer = { remove() { children.length = 0; }, empty() { children.length = 0; }, appendChild(el) { children.push(el); }, querySelector() { return children.find(e => e.svg) || null; } };
+  const ownerDocument = { createElementNS() { return { ...element(), svg: true }; } };
+  const layer = { ownerDocument, remove() { children.length = 0; }, empty() { children.length = 0; }, appendChild(el) { children.push(el); }, querySelector() { return children.find(e => e.svg) || null; } };
   const surface = { layer, width: () => 1300, hostLeft: () => 0, docTop: r => r.top, docHeight: () => 2000 };
   const m = { exports: {} };
   const source = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/layout.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText;

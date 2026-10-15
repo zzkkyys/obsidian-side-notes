@@ -12,19 +12,21 @@ class Target {
   contains() { return true; }
 }
 function harness() {
-  const content = new Target(), doc = new Target(); doc.body = { contains: () => true };
+  const content = new Target(), doc = new Target(), mainDoc = new Target(); doc.body = { contains: () => true };
+  content.isConnected = true; content.ownerDocument = doc;
   const view = { contentEl: content, file: { path: 'test.pdf' } };
   const pills = []; let opens = 0, selection = null;
+  doc.defaultView = { getSelection: () => selection };
   const m = { exports: {} };
   const code = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/pdf.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText;
   const plugin = { isAlive: true, settings: { pdfEnabled: true }, storage: { loadDoc: async () => ({ entries: [] }) },
     app: { workspace: { getLeavesOfType: () => [{ view }] } }, openPdfCreatePopover() { opens++; } };
-  vm.runInNewContext(code, { module: m, exports: m.exports, document: doc, window: { getSelection: () => selection },
+  vm.runInNewContext(code, { module: m, exports: m.exports, document: mainDoc, window: { getSelection: () => null },
     setTimeout, clearTimeout, Node: class {}, Element: class {},
     MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} },
     require: p => p === './popover' ? { SelectionPill: class { constructor() { pills.push(this); this.button = {}; } show() { this.visible = true; } hide() { this.visible = false; } ensureEl() { return this.button; } dispose() { this.dead = true; } } } : {} });
   const pdf = new m.exports.PdfGloss(plugin);
-  return { pdf, content, doc, pills, view, get opens() { return opens; }, set selection(v) { selection = v; } };
+  return { pdf, content, doc, mainDoc, pills, view, get opens() { return opens; }, set selection(v) { selection = v; } };
 }
 test('PDF repeated toggle removes capturing handlers, document handlers and selection pills', async () => {
   const h = harness();
@@ -52,4 +54,15 @@ test('PDF text selection offers a button without opening or focusing an editor',
   h.pills[0].button.onclick();
   assert.equal(h.opens, 1);
   h.pdf.dispose();
+});
+
+test('PDF retains secondary-window listeners across scans and releases them on disposal', async () => {
+  const h = harness(); h.pdf.scan(); await Promise.resolve();
+  const pill = h.pills[0];
+  h.pdf.scan(); await Promise.resolve();
+  assert.equal(h.pills.length, 1);
+  assert.notEqual(pill.dead, true);
+  assert.equal(h.mainDoc.handlers.length, 0);
+  assert.equal(h.doc.handlers.length, 3);
+  h.pdf.dispose(); assert.equal(h.doc.handlers.length, 0);
 });

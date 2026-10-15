@@ -38,7 +38,7 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
     const comp = new Component();
     component = comp;
     comp.load();
-    const body = document.createElement("div");
+    const body = parent.ownerDocument.createElement("div");
     try {
       await composer.ready();
       if (disposed || seq !== token || !shell.isConnected) return;
