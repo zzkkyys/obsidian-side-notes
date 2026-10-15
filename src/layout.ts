@@ -202,7 +202,9 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
     surface.syncLayer?.();
     const W2 = surface.width();
     for (const it of items) {
-      if (!it.active) continue;
+      // Preview virtualization can detach or hide an anchor before updateAnchors runs.
+      // Its empty rect is not a document position; retain the last valid geometry.
+      if (!it.active || !surface.host.contains(it.hlEl) || !it.hlEl.getClientRects().length) continue;
       const rect = it.hlEl.getBoundingClientRect();
       it.hlTop = surface.docTop(rect); it.hlH = rect.height;
       it.hlLeft = rect.left - surface.hostLeft(); it.hlRight = rect.right - surface.hostLeft();
@@ -242,7 +244,8 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
     svg.style.pointerEvents = "none";
     svg.replaceChildren();
     for (const it of list) {
-      if (!it.cardEl || !it.active) continue;
+      // Offscreen cards keep their cached document position, so keep their connector too.
+      if (!it.cardEl) continue;
       const y1 = it.hlTop + it.hlH / 2;
       const x1 = it.side === "left" ? it.hlLeft : it.hlRight;
       const y2 = it.cardTop + it.cardH / 2;
