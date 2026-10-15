@@ -1,3 +1,4 @@
+import { ATTACHMENTS_DIR } from "./types";
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type GlossPlugin from "./main";
 import { TypeManagerModal } from "./typemanager";
@@ -100,11 +101,11 @@ export class GlossSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("附件文件夹")
-      .setDesc("图片与其他附件的存放位置（库内相对路径）")
+      .setDesc("新附件的库内路径，默认隐藏在 .gloss/attachments；修改此项不移动已有附件。")
       .addText((t) => {
-        t.setValue(s.attachmentsFolder).setPlaceholder("gloss-attachments")
+        t.setValue(s.attachmentsFolder).setPlaceholder(ATTACHMENTS_DIR)
           .onChange(async (v) => {
-            s.attachmentsFolder = v.trim() || "gloss-attachments";
+            s.attachmentsFolder = v.trim() || ATTACHMENTS_DIR;
             await this.plugin.saveSettings();
           });
       });

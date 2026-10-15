@@ -22,6 +22,10 @@ npm run dev     # 监听源码改动并持续构建、部署
 
 部署仅复制 `main.js`、`styles.css` 和 `manifest.json` 到指定库的 `.obsidian/plugins/gloss/`；配置路径必须已包含 `.obsidian` 目录。部署不会修改插件设置、`.gloss/` 批注或附件。
 
+## 数据存放
+
+批注在 `.gloss/annotations/`，类型在 `.gloss/types.json`，附件默认在 `.gloss/attachments/`。旧版默认附件目录在启用插件时迁移，已有普通笔记引用的原文件会保留；自定义目录不变。导出时隐藏附件会复制到导出笔记旁的可见 `.assets/` 目录。同步与恢复细节见 [使用说明](使用说明.md)。
+
 ## 源码迁移
 
 2026-10-15，源码及 Git 仓库从测试库中的 `gloss/` 迁到本项目目录，保留已有提交历史。测试库内原有 Markdown 笔记继续保留，以维持已有链接和批注路径；后续开发请编辑本项目中的源码与文档。

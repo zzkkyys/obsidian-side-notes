@@ -1,3 +1,4 @@
+import { bindAttachmentLinks, openAttachment, renderAttachmentLinks } from "./attachment-open";
 import { Component, MarkdownRenderer, Modal, Notice, TFile, setIcon } from "obsidian";
 import type GlossPlugin from "./main";
 import type { GlossAttachment, GlossEntry, GlossType, GlossAnnotation } from "./types";
@@ -110,9 +111,12 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
     trackComp(body, comp);
     comp.load();
     try {
-      const markdown = renderImageReferences(note.content, note.attachments, a => resourceUrl(plugin, a.path));
+      const resource = (a: GlossAttachment) => resourceUrl(plugin, a.path);
+      const imagesMarkdown = renderImageReferences(note.content, note.attachments, resource);
+      const markdown = renderAttachmentLinks(imagesMarkdown, note.attachments, resource);
       await MarkdownRenderer.render(plugin.app, markdown, body, docPath, comp);
       if (!body.isConnected) return;
+      bindAttachmentLinks(plugin, body, note.attachments, comp, resource);
       const images = note.attachments.filter(a => a.kind === "image");
       for (const img of Array.from(body.querySelectorAll("img"))) {
         const a = attachmentForSource(images, img.getAttribute("src") ?? img.src, a => resourceUrl(plugin, a.path));
@@ -189,9 +193,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
       const link = row.createEl("a", { cls: "gloss-attach-file", text: a.name });
       link.onclick = (e) => {
         e.preventDefault();
-        const file = plugin.app.vault.getAbstractFileByPath(a.path);
-        if (!(file instanceof TFile)) { new Notice(`附件缺失或尚未同步：${a.name}`); return; }
-        void plugin.app.workspace.getLeaf(false).openFile(file);
+        void openAttachment(plugin, a, card.ownerDocument).catch(error => new Notice(errMsg(error)));
       };
       icon.setText("📄");
     }

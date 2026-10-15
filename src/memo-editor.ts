@@ -1,3 +1,4 @@
+import { bindAttachmentLinks, renderAttachmentLinks } from "./attachment-open";
 import { Component, MarkdownRenderer, Notice } from "obsidian";
 import type GlossPlugin from "./main";
 import type { GlossAttachment } from "./types";
@@ -42,9 +43,12 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
     try {
       await composer.ready();
       if (disposed || seq !== token || !shell.isConnected) return;
-      const markdown = renderImageReferences(input.value, attachments, a => plugin.app.vault.adapter.getResourcePath(a.path));
+      const resource = (a: GlossAttachment) => plugin.app.vault.adapter.getResourcePath(a.path);
+      const imagesMarkdown = renderImageReferences(input.value, attachments, resource);
+      const markdown = renderAttachmentLinks(imagesMarkdown, attachments, resource);
       await MarkdownRenderer.render(plugin.app, markdown, body, docPath, comp);
       if (disposed || seq !== token || !shell.isConnected) return;
+      bindAttachmentLinks(plugin, body, attachments, comp, resource);
       if (!input.value.trim()) body.createSpan({ cls: "gloss-empty", text: "还没有正文" });
       renderGallery(plugin, body, attachments, input.value);
       for (const a of attachments.filter(a => a.kind !== "image")) body.createDiv({ cls: "gloss-image-name", text: a.name });

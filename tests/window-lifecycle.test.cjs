@@ -101,12 +101,15 @@ test('connected Markdown view in another document reaches rendering', async () =
   await h.plugin.renderView({ contentEl, file: { path: 'secondary.md' } }, true);
   assert.equal(h.surfaces, 1);
 });
-test('plugin unload closes its create popup before waiting for storage flush', async () => {
-  const h = mainHarness(), pop = new El(h.secondary); let flushed = false;
-  Object.assign(h.plugin, { alive: true, createPop: { el: pop, docPath: 'note.md' }, popoverOpen: true,
+test('plugin unload closes its popup, waits for attachment migration, then flushes storage', async () => {
+  const h = mainHarness(), pop = new El(h.secondary); let flushed = false, finishMigration;
+  const attachmentMigration = new Promise(resolve => { finishMigration = resolve; });
+  Object.assign(h.plugin, { attachmentMigration, alive: true, createPop: { el: pop, docPath: 'note.md' }, popoverOpen: true,
     storage: { onStatusChange() {}, async flushAll() { assert.equal(pop.isConnected, false); flushed = true; } },
     app: { vault: {}, workspace: { getLeavesOfType: () => [] } }, pdf: null, renderTimers: new Map(), sizeObservers: new Map(), readingObservers: new Map(), layoutMap: new Map(), windowCleanups: new Map() });
-  await h.plugin.onunload(); assert.equal(h.dismissed, 1); assert.equal(h.plugin.popoverOpen, false); assert.equal(flushed, true);
+  const unloaded = h.plugin.onunload(); await Promise.resolve();
+  assert.equal(flushed, false); assert.equal(pop.isConnected, false);
+  finishMigration(); await unloaded; assert.equal(h.dismissed, 1); assert.equal(h.plugin.popoverOpen, false); assert.equal(flushed, true);
 });
 
 test('save completion after unload does not reopen a bubble', async () => {

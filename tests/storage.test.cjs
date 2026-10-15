@@ -39,9 +39,11 @@ function fixture(initial = {}) {
     mkdir: async p => { if (!dirs.has(parent(p))) throw Error('parent missing: ' + p); dirs.add(p); },
     write: async (p, value) => { if (!dirs.has(parent(p))) throw Error('parent missing: ' + p); disk.set(p, value); },
     remove: async p => disk.delete(p),
+    writeBinary: async (p, value) => { if (!dirs.has(parent(p))) throw Error('parent missing'); disk.set(p, value); },
+    trashLocal: async p => { disk.set('.trash/' + p.split('/').pop(), disk.get(p)); disk.delete(p); },
     list: async p => ({ files: [...disk.keys()].filter(k => parent(k) === p), folders: [...dirs].filter(k => k && parent(k) === p) }),
   };
-  const vault = { adapter, getMarkdownFiles: () => [], getAbstractFileByPath: p => disk.has(p) ? new MockTFile(p) : null, trash: async file => { disk.set(".trash/" + file.path.split("/").pop(), disk.get(file.path)); disk.delete(file.path); }, createBinary: async (p, bytes) => { if (disk.has(p)) throw Error('exists'); await adapter.write(p, bytes); } };
+  const vault = { adapter, getMarkdownFiles: () => [], getAbstractFileByPath: p => disk.has(p) && !p.split('/').some(x => x.startsWith('.')) ? new MockTFile(p) : null, trash: async file => { disk.set(".trash/" + file.path.split("/").pop(), disk.get(file.path)); disk.delete(file.path); }, createBinary: async (p, bytes) => { if (disk.has(p)) throw Error('exists'); await adapter.write(p, bytes); } };
   return { storage: new GlossStorage({ app: { vault } }), adapter, disk };
 }
 const ids = store => Array.from(store.entries, e => e.note.id);
@@ -552,4 +554,54 @@ test('legacy cloud placeholders prevent a new annotation file from shadowing und
     await f.storage.createEntry(p, note('NEW'));
     assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['OLD', 'NEW']);
   });
+});
+
+
+test('hidden attachment uploads use the adapter and concurrent same names never overwrite', async () => {
+  const f = fixture();
+  assert.equal(await f.storage.ensureAttachmentsDir(), '.gloss/attachments');
+  const paths = await Promise.all([1, 2].map(n => f.storage.saveBinary('.gloss/attachments', 'n', 'pic.png', new Uint8Array([n]).buffer)));
+  assert.deepEqual(paths, ['.gloss/attachments/n/pic.png', '.gloss/attachments/n/pic (1).png']);
+  assert.deepEqual(paths.map(p => [...new Uint8Array(f.disk.get(p))]), [[1], [2]]);
+});
+test('custom visible attachment folders keep the Vault API', async () => {
+  const f = fixture(); f.storage.plugin = { settings: { attachmentsFolder: 'my-images' } };
+  f.adapter.writeBinary = async () => { throw Error('must use Vault API'); };
+  assert.equal(await f.storage.ensureAttachmentsDir(), 'my-images');
+  assert.equal(await f.storage.saveBinary('my-images', 'n', 'pic.png', new Blob(['ok'])), 'my-images/n/pic.png');
+});
+test('hidden uploads respect cloud placeholders and stop on unreadable listings', async () => {
+  const f = fixture({ '.gloss/attachments/n/.pic.png.icloud': 'placeholder' });
+  assert.equal(await f.storage.saveBinary('.gloss/attachments', 'n', 'pic.png', new ArrayBuffer(1)), '.gloss/attachments/n/pic (1).png');
+  f.adapter.list = async () => { throw Error('offline'); };
+  await assert.rejects(f.storage.saveBinary('.gloss/attachments', 'n', 'new.png', new ArrayBuffer(1)), /offline/);
+  assert.equal(f.disk.has('.gloss/attachments/n/new.png'), false);
+});
+test('hidden draft cleanup skips JSON attachments and protects metadata references', async () => {
+  const keep = '.gloss/attachments/n/keep.png', cancel = '.gloss/attachments/n/cancel.json';
+  const f = fixture({ [keep]: 'image', [cancel]: 'invalid JSON binary', '.gloss/conflicts/keep.json': JSON.stringify({ path: keep }) });
+  await f.storage.cleanupDraftUploads([keep, cancel]);
+  assert.ok(f.disk.has(keep)); assert.equal(f.disk.has(cancel), false); assert.ok(f.disk.has('.trash/cancel.json'));
+});
+test('attachment paths reject escaping the vault', async () => {
+  const f = fixture();
+  for (const folder of ['/tmp', '../outside', 'foo/../bar', 'foo\\bar', 'C:/tmp']) {
+    await assert.rejects(f.storage.saveBinary(folder, 'n', 'pic.png', new ArrayBuffer(1)), /库内相对路径/);
+  }
+  assert.equal(f.disk.size, 0);
+});
+
+
+test('custom .gloss root still scans conflict metadata before cleanup', async () => {
+  const p = '.gloss/n/pic.png';
+  const f = fixture({ [p]: 'image', '.gloss/conflicts/backup.json': JSON.stringify({ path: p }) });
+  f.storage.plugin = { settings: { attachmentsFolder: '.gloss' } };
+  await f.storage.cleanupDraftUploads([p]);
+  assert.ok(f.disk.has(p)); assert.equal(f.disk.has('.trash/pic.png'), false);
+});
+test('cloud directory placeholders block new hidden uploads', async () => {
+  const f = fixture({ '.gloss/.attachments.icloud': 'placeholder' });
+  await assert.rejects(f.storage.ensureAttachmentsDir(), /尚未同步完成/);
+  await assert.rejects(f.storage.saveBinary('.gloss/attachments', 'n', 'pic.png', new ArrayBuffer(1)), /尚未同步完成/);
+  assert.equal(f.disk.has('.gloss/attachments/n/pic.png'), false);
 });

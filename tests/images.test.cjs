@@ -175,3 +175,41 @@ test('percent escapes and spaces identify distinct attachments in Markdown and W
     }
   }
 });
+
+
+test('attachment relocation preserves Markdown titles, labels and Wiki aliases', () => {
+  const { moveAttachmentReferences } = moduleImage.exports;
+  const file = { ...a, path: 'old/pic (1).png' };
+  const before = '![my label](<old/pic%20%281%29.png> "title") [file](<old/pic%20%281%29.png>) ![[old/pic (1).png|200]] [[old/pic (1).png|alias]]';
+  const after = moveAttachmentReferences(before, file, '.gloss/attachments/new (1).png');
+  assert.equal(after, '![my label](<.gloss/attachments/new%20%281%29.png> "title") [file](<.gloss/attachments/new%20%281%29.png>) ![[.gloss/attachments/new (1).png|200]] [[.gloss/attachments/new (1).png|alias]]');
+  assert.equal(moveAttachmentReferences('[literal](<old/pic%2520%281%29.png>)', file, 'new.png'), '[literal](<old/pic%2520%281%29.png>)');
+});
+
+
+test('titled hidden images render through adapter resource URLs', () => {
+  const { renderImageReferences } = moduleImage.exports;
+  const file = { ...a, path: '.gloss/attachments/a.png' };
+  assert.ok(renderImageReferences('![label](<.gloss/attachments/a.png> "title")', [file], () => 'app://resource/a.png').includes('app://resource/a.png'));
+});
+
+
+test('reference-style images render and relocate definitions without changing labels or titles', () => {
+  const { renderImageReferences, moveAttachmentReferences } = moduleImage.exports;
+  const file = { ...a, path: '.gloss/attachments/a photo.png' };
+  const text = '![caption][asset]\n\n  [asset]: <.gloss/attachments/a%20photo.png> "image title"';
+  assert.equal(renderImageReferences(text, [file], () => 'app://resource/a%20photo.png'),
+    '![caption][asset]\n\n  [asset]: <app://resource/a%20photo.png> "image title"');
+  assert.equal(moveAttachmentReferences(text, file, 'export.assets/a photo.png'),
+    '![caption][asset]\n\n  [asset]: <export.assets/a%20photo.png> "image title"');
+});
+
+test('reference definition matching distinguishes literal percent names from spaces and ignores unrelated URLs', () => {
+  const { rewriteAttachmentDefinitions } = moduleImage.exports;
+  const literal = { ...a, path: 'my%20photo.png' }, spaced = { ...a, path: 'my photo.png' };
+  const text = '[percent]: my%2520photo.png\n[space]: my%20photo.png\n[web]: https://example.com/my%20photo.png\n    [code]: my%20photo.png';
+  assert.equal(rewriteAttachmentDefinitions(text, literal, 'literal.png'),
+    '[percent]: <literal.png>\n[space]: my%20photo.png\n[web]: https://example.com/my%20photo.png\n    [code]: my%20photo.png');
+  assert.equal(rewriteAttachmentDefinitions(text, spaced, 'space.png'),
+    '[percent]: my%2520photo.png\n[space]: <space.png>\n[web]: https://example.com/my%20photo.png\n    [code]: my%20photo.png');
+});

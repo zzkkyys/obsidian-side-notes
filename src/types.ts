@@ -139,7 +139,7 @@ export function defaultSettings(): GlossSettings {
     highlightStyle: "underline",
     cardStyle: "plain",
     defaultTypeId: "general",
-    attachmentsFolder: "gloss-attachments",
+    attachmentsFolder: ATTACHMENTS_DIR,
     pdfEnabled: true,
   };
 }
@@ -148,6 +148,8 @@ export function defaultSettings(): GlossSettings {
 
 export const GLOSS_DIR = ".gloss";
 export const ANN_DIR = `${GLOSS_DIR}/annotations`;
+export const ATTACHMENTS_DIR = `${GLOSS_DIR}/attachments`;
+export const LEGACY_ATTACHMENTS_DIR = "gloss-attachments";
 
 /**
  * 路径 → 批注文件名编码（单遍扫描，无损可逆）：`_` → `__`，`/` → `/_`。

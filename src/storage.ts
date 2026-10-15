@@ -1,7 +1,7 @@
 import { moveImageReferences } from "./image-model";
 import { Notice, TFile, type Plugin } from "obsidian";
 import {
-  ANN_DIR, GHOST_TYPE, GLOSS_DIR, defaultTypes, currentTypeId, migrateBuiltinTypes, isMdPath, legacySafePath, safePath, unsafePath,
+  ANN_DIR, ATTACHMENTS_DIR, GHOST_TYPE, GLOSS_DIR, defaultTypes, currentTypeId, migrateBuiltinTypes, isMdPath, legacySafePath, safePath, unsafePath,
   type GlossDocStore, type GlossEntry, type GlossType, type GlossAnnotation,
 } from "./types";
 
@@ -70,6 +70,7 @@ export class GlossStorage {
   /** 批量附件更新持有枚举到的 store；连续改名串行完成后才允许驱逐。 */
   private attachmentMoves = 0;
   private attachmentMoveChain: Promise<void> = Promise.resolve();
+  private binaryWrites: Promise<unknown> = Promise.resolve();
   setActivePaths(paths: string[]): void { this.activePaths = new Set(paths); }
   get problems(): string[] { return [...new Set([...this.conflicts.keys(), ...this.errors.keys()])]; }
   get hasProblems(): boolean { return this.problems.length > 0; }
@@ -845,6 +846,7 @@ export class GlossStorage {
 
   /** 插件卸载前把所有防抖写盘落盘（含类型防抖）；单文档失败不中断其余 */
   async flushAll(): Promise<void> {
+    await this.binaryWrites;
     await this.attachmentMoveChain;
     await this.waitForMigrations();
     for (const state of this.docs.values()) {
@@ -870,6 +872,7 @@ export class GlossStorage {
     try {
       const texts: string[] = [...this.docs.values()].filter(s => s.store).map(s => JSON.stringify(s.store));
       const scan = async (dir: string): Promise<void> => {
+        if (dir === ATTACHMENTS_DIR) return;
         if (!(await this.app.vault.adapter.exists(dir))) return;
         const listing = await this.app.vault.adapter.list(dir);
         for (const file of listing.files) if (file.endsWith(".json")) texts.push(await this.app.vault.adapter.read(`${dir}/${file.split("/").pop()}`));
@@ -884,42 +887,61 @@ export class GlossStorage {
         if (this.migrationBarrier || [...this.docs.values()].some(s => this.isBusy(s))) return;
         const file = this.app.vault.getAbstractFileByPath(path);
         if (file instanceof TFile) await this.app.vault.trash(file, false);
+        else if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.trashLocal(path);
       }
     } catch (error) { console.warn("[Gloss] 附件引用无法完整核实，保留剩余文件", error); }
   }
 
   async ensureAttachmentsDir(): Promise<string> {
-    const folder = (this.plugin?.settings.attachmentsFolder || "gloss-attachments").trim() || "gloss-attachments";
-    if (!(await this.app.vault.adapter.exists(folder))) {
-      await this.app.vault.adapter.mkdir(folder);
-    }
+    const folder = (this.plugin?.settings.attachmentsFolder || ATTACHMENTS_DIR).trim() || ATTACHMENTS_DIR;
+    this.checkAttachmentPath(folder);
+    await this.checkAttachmentParents(folder);
+    await this.ensureParent(`${folder}/placeholder`);
     return folder;
   }
 
   /** 保存二进制附件，返回库内路径。同名自动加序号，避免覆盖/报错 */
-  async saveBinary(baseFolder: string, subId: string, name: string, data: Blob | ArrayBuffer): Promise<string> {
+  saveBinary(baseFolder: string, subId: string, name: string, data: Blob | ArrayBuffer): Promise<string> {
+    // Adapter.writeBinary can overwrite, unlike Vault.createBinary. Serialize local uploads
+    // so two editors uploading the same filename cannot claim the same free destination.
+    const task = this.binaryWrites.then(() => this.writeAttachment(baseFolder, subId, name, data));
+    this.binaryWrites = task.catch(() => undefined);
+    return task;
+  }
+
+  private checkAttachmentPath(path: string): void {
+    if (!path || /^[\\/]|^[a-z]:/i.test(path) || path.includes("\\")
+        || path.split("/").some(part => !part || part === "." || part === "..")) {
+      throw new Error("附件路径必须是库内相对路径，不能包含空层级或 ..");
+    }
+  }
+
+  private async checkAttachmentParents(dir: string): Promise<void> {
+    const parts = dir.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const parent = parts.slice(0, i).join("/");
+      if (await this.hasCloudPlaceholder(parent)) throw new Error(`附件目录尚未同步完成：${parent}`);
+    }
+  }
+
+  private async writeAttachment(baseFolder: string, subId: string, name: string, data: Blob | ArrayBuffer): Promise<string> {
     const dir = `${baseFolder}/${subId}`;
-    if (!(await this.app.vault.adapter.exists(dir))) {
-      await this.app.vault.adapter.mkdir(dir);
-    }
-    let existing = new Set<string>();
-    try {
-      for (const fRaw of (await this.app.vault.adapter.list(dir)).files) {
-        const b = fRaw.split("/").pop();
-        if (b) existing.add(b);
-      }
-    } catch { /* 目录刚建，视为空 */ }
-    if (existing.has(name)) {
-      const dot = name.lastIndexOf(".");
-      const stem = dot > 0 ? name.slice(0, dot) : name;
-      const ext = dot > 0 ? name.slice(dot) : "";
-      let i = 1;
-      while (existing.has(`${stem} (${i})${ext}`)) i++;
-      name = `${stem} (${i})${ext}`;
-    }
-    const path = `${dir}/${name}`;
+    this.checkAttachmentPath(`${dir}/${name}`);
+    await this.checkAttachmentParents(dir);
+    await this.ensureParent(`${dir}/${name}`);
+    const adapter = this.app.vault.adapter;
+    // A failed listing must not turn into an empty folder and permit overwriting a file.
+    const existing = new Set((await adapter.list(dir)).files.map(file => file.split("/").pop()));
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    let candidate = name, index = 1;
+    while (existing.has(candidate) || await adapter.exists(`${dir}/${candidate}`)
+      || await this.hasCloudPlaceholder(`${dir}/${candidate}`)) candidate = `${stem} (${index++})${ext}`;
+    const path = `${dir}/${candidate}`;
     const buf: ArrayBuffer = data instanceof Blob ? await data.arrayBuffer() : data;
-    await this.app.vault.createBinary(path, buf);
+    if (path.split("/").some(part => part.startsWith("."))) await adapter.writeBinary(path, buf);
+    else await this.app.vault.createBinary(path, buf);
     return path;
   }
 }

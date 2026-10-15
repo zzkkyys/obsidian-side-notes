@@ -9,7 +9,7 @@ export function imageMarkdown(a: GlossAttachment): string {
 /** Match by destination, so editing alt text does not duplicate the bottom thumbnail. */
 function references(content: string, a: GlossAttachment): string[] {
   const refs: string[] = [];
-  const pattern = /!\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s)]+))\s*\)|!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+  const pattern = /!\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?\s*\)|!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(content))) {
     let path = match[1] ?? match[2] ?? match[3];
@@ -42,6 +42,7 @@ export function renderImageReferences(content: string, attachments: GlossAttachm
       const label = a.name.replace(/[\\\[\]\r\n]/g, "_");
       content = content.split(ref).join(`![${label}](<${resource(a)}>)`);
     }
+    content = rewriteAttachmentDefinitions(content, a, resource(a));
   }
   return content;
 }
@@ -60,4 +61,30 @@ export function attachmentForSource(images: GlossAttachment[], source: string, r
 export function moveImageReferences(content: string, attachment: GlossAttachment, newPath: string): string {
   for (const ref of references(content, attachment)) content = content.split(ref).join(imageMarkdown({ ...attachment, path: newPath }));
   return content;
+}
+
+/** Move registered attachment destinations in images, ordinary links and Wiki links. */
+export function moveAttachmentReferences(content: string, attachment: GlossAttachment, newPath: string): string {
+  const encoded = newPath.split("/").map(p => encodeURIComponent(p).replace(/[!'()*]/g,
+    c => `%${c.charCodeAt(0).toString(16)}`)).join("/");
+  content = content.replace(/(!?)\[([^\]\n]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))(\s+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?\s*\)|(!?)\[\[([^\]|]+)(\|[^\]]*)?\]\]/g,
+    (ref, image, label, anglePath, plainPath, title, wikiImage, wikiPath, alias) => {
+      let path = wikiPath ?? anglePath ?? plainPath;
+      if (wikiPath === undefined) {
+        try { path = decodeURIComponent(path); } catch { /* Match malformed escapes literally. */ }
+      }
+      if (path !== attachment.path) return ref;
+      return wikiPath === undefined ? `${image}[${label}](<${encoded}>${title ?? ""})` : `${wikiImage}[[${newPath}${alias ?? ""}]]`;
+    });
+  return rewriteAttachmentDefinitions(content, attachment, encoded);
+}
+
+/** Reference-style links keep their label and optional title; only the exact URL changes. */
+export function rewriteAttachmentDefinitions(content: string, attachment: GlossAttachment, destination: string): string {
+  return content.replace(/^([ ]{0,3}\[[^\]\r\n]+\]:[ \t]*)(?:<([^>\r\n]+)>|([^\s]+))/gm,
+    (ref, prefix, anglePath, plainPath) => {
+      let path = anglePath ?? plainPath;
+      try { path = decodeURIComponent(path); } catch { /* Match malformed escapes literally. */ }
+      return path === attachment.path ? `${prefix}<${destination}>` : ref;
+    });
 }

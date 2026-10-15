@@ -1,3 +1,4 @@
+import { migrateLegacyAttachments } from "./attachment-migration";
 import { MarkdownView, Menu, Modal, Notice, Plugin, TFile, TFolder, type EventRef } from "obsidian";
 import { applyCardStyle } from "./card-style";
 import { EditorHighlights, sourceRange } from "./editor";
@@ -12,6 +13,8 @@ import { GlossStorage } from "./storage";
 import { TypeManagerModal } from "./typemanager";
 import {
   defaultSettings,
+  ATTACHMENTS_DIR,
+  LEGACY_ATTACHMENTS_DIR,
   currentTypeId,
   type Anchor,
   type GlossAttachment,
@@ -52,6 +55,7 @@ export default class GlossPlugin extends Plugin {
   private renderSeq = new WeakMap<HTMLElement, number>();
   /** 插件存活标志：卸载后一切异步回调立即退出 */
   private alive = true;
+  private attachmentMigration: Promise<void> = Promise.resolve();
 
   get isAlive(): boolean { return this.alive; }
 
@@ -59,9 +63,29 @@ export default class GlossPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await shutdowns.get(this.app.vault);
+    if (!this.alive) return;
     await this.loadSettings();
+    if (!this.alive) return;
     this.storage.plugin = this;
+    // Run before loading stores or rendering UI, so no editor retains pre-migration paths.
+    if ([LEGACY_ATTACHMENTS_DIR, ATTACHMENTS_DIR].includes(this.settings.attachmentsFolder)) {
+      this.attachmentMigration = (async () => {
+        try {
+          const migrated = await migrateLegacyAttachments(this.app);
+          if (this.settings.attachmentsFolder === LEGACY_ATTACHMENTS_DIR) {
+            this.settings.attachmentsFolder = ATTACHMENTS_DIR;
+            await this.saveSettings();
+          }
+          if (migrated.moved) new Notice(`Gloss：已将 ${migrated.moved} 个附件迁入 .gloss/attachments`);
+        } catch (error) {
+          new Notice(`Gloss：附件迁移未完成，请检查错误并在恢复后重新启用插件。${String(error)}`);
+        }
+      })();
+      await this.attachmentMigration;
+    }
+    if (!this.alive) return;
     await this.storage.loadTypes();
+    if (!this.alive) return;
     this.storage.onStatusChange = () => this.updateStatus();
     this.addCommand({ id: "resolve-save-problems", name: "处理保存问题", callback: () => this.openSaveProblems() });
 
@@ -236,7 +260,7 @@ export default class GlossPlugin extends Plugin {
     this.closeCreatePopover();
     closeTypeMenu();
     this.storage.onStatusChange = () => {};
-    const flushed = this.storage.flushAll();
+    const flushed = this.attachmentMigration.then(() => this.storage.flushAll());
     shutdowns.set(this.app.vault, flushed);
     for (const t of this.renderTimers.values()) clearTimeout(t);
     this.renderTimers.clear();
