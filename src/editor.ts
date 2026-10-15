@@ -9,41 +9,75 @@ import { GlossBubble } from "./popover";
 
 const refresh = StateEffect.define<null>();
 
+interface ReadingProjection { plain: string; map: number[] }
+
+// Every annotation in a rebuild uses the same source text. Retain only the latest
+// projection, including the no-markup result, so other documents do not accumulate.
+let recentProjection: { text: string; value: ReadingProjection | null } | null = null;
+function readingProjection(text: string): ReadingProjection | null {
+  if (recentProjection?.text === text) return recentProjection.value;
+  const hidden = new Set<number>();
+  const hide = (start: number, end: number) => { for (let i = start; i < end; i++) hidden.add(i); };
+  for (const pattern of [/\*\*|__|~~|`/g, /^ {0,3}(?:#{1,6}|>|[-+*])\s/gm]) {
+    for (const match of text.matchAll(pattern)) hide(match.index!, match.index! + match[0].length);
+  }
+  for (const match of text.matchAll(/\[([^\]]+)\]\([^)]*\)/g)) {
+    hide(match.index!, match.index! + 1);
+    hide(match.index! + 1 + match[1].length, match.index! + match[0].length);
+  }
+  let value: ReadingProjection | null = null;
+  if (hidden.size) {
+    const map: number[] = [];
+    let plain = "";
+    for (let i = 0; i < text.length; i++) if (!hidden.has(i)) { plain += text[i]; map.push(i); }
+    value = { plain, map };
+  }
+  recentProjection = { text, value };
+  return value;
+}
+
 /** 源码坐标独立于渲染坐标；重复文本必须由上下文消歧。 */
 export function sourceRange(text: string, anchor: MdAnchor, project = true): { from: number; to: number } | null {
   const source = anchor.source;
   const needle = source?.text ?? anchor.text;
   if (!needle) return null;
-  const matches: Array<{ from: number; to: number; score: number }> = [];
-  for (let from = text.indexOf(needle); from >= 0; from = text.indexOf(needle, from + 1)) {
-    const to = from + needle.length;
-    const prefix = source?.prefix ?? anchor.prefix;
-    const suffix = source?.suffix ?? anchor.suffix;
-    const before = !prefix || similarContext(text.slice(Math.max(0, from - prefix.length), from), prefix);
-    const after = !suffix || similarContext(text.slice(to, to + suffix.length), suffix);
-    const score = (prefix && before ? 4 : 0) + (suffix && after ? 4 : 0) + (source?.from === from && before && after ? 1 : 0);
-    matches.push({ from, to, score });
+  const prefix = source?.prefix ?? anchor.prefix;
+  const suffix = source?.suffix ?? anchor.suffix;
+  const findMatches = (haystack: string) => {
+    const matches: Array<{ from: number; to: number; score: number }> = [];
+    for (let from = haystack.indexOf(needle); from >= 0; from = haystack.indexOf(needle, from + 1)) {
+      const to = from + needle.length;
+      const before = !prefix || similarContext(haystack.slice(Math.max(0, from - prefix.length), from), prefix);
+      const after = !suffix || similarContext(haystack.slice(to, to + suffix.length), suffix);
+      const score = (prefix && before ? 4 : 0) + (suffix && after ? 4 : 0) + (source?.from === from && before && after ? 1 : 0);
+      // Reading anchors carry context too; a unique unrelated quote is not a match.
+      if ((prefix || suffix) && score === 0) continue;
+      matches.push({ from, to, score });
+    }
+    return matches;
+  };
+  const matches = findMatches(text);
+  if (!source && project) {
+    // Reading quotes may span Markdown markup. Compare projected and raw candidates
+    // together so an unrelated raw quote cannot hide the original formatted passage.
+    const projection = readingProjection(text);
+    if (projection) {
+      const { plain, map } = projection;
+      const byRange = new Map(matches.map(match => [`${match.from}:${match.to}`, match]));
+      for (const match of findMatches(plain)) {
+        const from = map[match.from], to = map[match.to - 1] + 1;
+        const key = `${from}:${to}`;
+        const existing = byRange.get(key);
+        if (existing) existing.score = Math.max(existing.score, match.score);
+        else {
+          const candidate = { from, to, score: match.score };
+          matches.push(candidate); byRange.set(key, candidate);
+        }
+      }
+    }
   }
   matches.sort((a, b) => b.score - a.score);
-  if (!matches.length && !source && project) {
-    // 阅读视图创建的引用不包含 Markdown 包装符；映射回源码字符坐标。
-    const hidden = new Set<number>();
-    const hide = (start: number, end: number) => { for (let i = start; i < end; i++) hidden.add(i); };
-    for (const pattern of [/\*\*|__|~~|`/g, /^ {0,3}(?:#{1,6}|>|[-+*])\s/gm]) {
-      for (const match of text.matchAll(pattern)) hide(match.index!, match.index! + match[0].length);
-    }
-    for (const match of text.matchAll(/\[([^\]]+)\]\([^)]*\)/g)) {
-      hide(match.index!, match.index! + 1);
-      hide(match.index! + 1 + match[1].length, match.index! + match[0].length);
-    }
-    const map: number[] = [];
-    let plain = "";
-    for (let i = 0; i < text.length; i++) if (!hidden.has(i)) { plain += text[i]; map.push(i); }
-    const range = sourceRange(plain, anchor, false);
-    return range ? { from: map[range.from], to: map[range.to - 1] + 1 } : null;
-  }
   if (!matches.length || (matches.length > 1 && matches[0].score === matches[1].score)) return null;
-  if (source && (source.prefix || source.suffix) && matches[0].score === 0) return null;
   return matches[0];
 }
 

@@ -28,7 +28,7 @@ export function findBlockEl(from: Node | null, fallbackSel?: string): HTMLElemen
 
 /** 块内纯文本（跳过 Gloss 自身 UI 的文本节点） */
 export function blockPlainText(el: HTMLElement): string {
-  const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const w = (el.ownerDocument ?? document).createTreeWalker(el, NodeFilter.SHOW_TEXT);
   let out = "";
   let n: Node | null;
   while ((n = w.nextNode())) {
@@ -74,55 +74,72 @@ export function locateAnchor(host: HTMLElement, a: MdAnchor, genericSelector?: s
 
 }
 
-/** 返回所有精确命中，并用创建时的上下文消除重复文字歧义。 */
-export function textMatches(text: string, a: MdAnchor): Array<{ start: number; end: number; score: number }> {
-  const found: Array<{ start: number; end: number; score: number }> = [];
+interface TextMatch { start: number; end: number; score: number }
+
+/** Score every candidate with its context; callers decide whether the best hit is unique. */
+function exactTextMatches(text: string, a: MdAnchor, baseScore: number): TextMatch[] {
+  const found: TextMatch[] = [];
   if (!a.text) return found;
   for (let i = text.indexOf(a.text); i >= 0; i = text.indexOf(a.text, i + 1)) {
-    let score = 10;
+    let score = baseScore;
     if (a.blockText === text) score += 100;
     if (a.prefix && text.slice(Math.max(0, i - a.prefix.length), i) === a.prefix) score += 40;
     if (a.suffix && text.slice(i + a.text.length, i + a.text.length + a.suffix.length) === a.suffix) score += 40;
     if (a.prefix && similarContext(text.slice(Math.max(0, i - a.prefix.length), i), a.prefix)) score += 10;
     if (a.suffix && similarContext(text.slice(i + a.text.length, i + a.text.length + a.suffix.length), a.suffix)) score += 10;
     if ((a.blockText === text || a.blockId) && i === a.start) score += 20;
-    if (a.blockText && (a.prefix || a.suffix) && score === 10) continue;
+    if (a.blockText && (a.prefix || a.suffix) && score === baseScore) continue;
     found.push({ start: i, end: i + a.text.length, score });
   }
-  if (found.length) return found;
-  if (text.includes(a.text)) return []; // 有同文但上下文已不符，不再用宽松匹配绕过校验
-  const normalized = normalizedRange(text, a.text);
-  // 带上下文的新锚点不使用删标点的猜测匹配。
-  const fallback = normalized ?? (!a.blockText ? looseRange(text, a.text) : null);
-  return fallback ? [{ ...fallback, score: 0 }] : [];
+  return found;
 }
 
-/**
- * 空白/换行容错匹配：把两侧空白序列都折叠成单个空格后查找，
- * 再把命中位置映射回原文坐标。解决源码模式锚点（join 成空格）
- * 与渲染层（保留 \n）不一致导致的 orphan 问题。
- */
-function normalizedRange(haystack: string, needle: string): { start: number; end: number } | null {
-  const needleN = needle.replace(/\s+/g, " ").trim();
-  if (needleN.length < 2) return null;
-  let hN = "";
-  const map: number[] = []; // hN 下标 -> haystack 下标
-  for (let i = 0; i < haystack.length; i++) {
-    const ch = haystack[i];
-    if (/\s/.test(ch)) {
-      if (hN.length === 0 || hN[hN.length - 1] !== " ") {
-        hN += " ";
-        map.push(i);
+const normalizeWhitespace = (text: string) => text.replace(/\s+/g, " ");
+
+/** 精确和空白容错候选都必须用创建时的上下文消歧。 */
+export function textMatches(text: string, a: MdAnchor): TextMatch[] {
+  if (!a.text) return [];
+  const found = exactTextMatches(text, a, 10);
+  const collapsedText = normalizeWhitespace(text);
+  const normalizedText = collapsedText.trim();
+  const leading = a.text.match(/^\s*/)?.[0] ?? "";
+  const trailing = a.text.match(/\s*$/)?.[0] ?? "";
+  const normalizedAnchor: MdAnchor = {
+    ...a,
+    text: normalizeWhitespace(a.text).trim(),
+    blockText: a.blockText === undefined ? undefined : normalizeWhitespace(a.blockText).trim(),
+    prefix: a.prefix === undefined ? undefined : normalizeWhitespace(a.prefix + leading).trimStart(),
+    suffix: a.suffix === undefined ? undefined : normalizeWhitespace(trailing + a.suffix).trimEnd(),
+    // Stored offsets refer to the original block, not the newly normalized one.
+    start: a.blockText === undefined ? -1 : normalizeWhitespace(a.blockText.slice(0, a.start) + leading).trimStart().length,
+  };
+  const changed = normalizedText !== text || normalizedAnchor.text !== a.text
+    || normalizedAnchor.blockText !== a.blockText || normalizedAnchor.prefix !== a.prefix || normalizedAnchor.suffix !== a.suffix;
+  if (changed && normalizedAnchor.text.length >= 2) {
+    const starts: number[] = [], ends: number[] = [];
+    for (let i = 0; i < text.length; i++) {
+      const start = i;
+      if (/\s/.test(text[i])) while (i + 1 < text.length && /\s/.test(text[i + 1])) i++;
+      starts.push(start); ends.push(i + 1);
+    }
+    const trimOffset = collapsedText.length - collapsedText.trimStart().length;
+    const byRange = new Map(found.map(match => [`${match.start}:${match.end}`, match]));
+    for (const match of exactTextMatches(normalizedText, normalizedAnchor, 0)) {
+      const start = starts[match.start + trimOffset], end = ends[match.end - 1 + trimOffset];
+      const key = `${start}:${end}`;
+      const existing = byRange.get(key);
+      if (existing) existing.score = Math.max(existing.score, match.score);
+      else {
+        const candidate = { start, end, score: match.score };
+        found.push(candidate); byRange.set(key, candidate);
       }
-    } else {
-      hN += ch;
-      map.push(i);
     }
   }
-  const i = hN.indexOf(needleN);
-  if (i < 0) return null;
-  const last = i + needleN.length - 1;
-  return { start: map[i], end: map[last] + 1 };
+  if (found.length) return found;
+  // A quote with rejected context must not reappear through punctuation stripping.
+  if (text.includes(a.text) || normalizedText.includes(normalizedAnchor.text)) return [];
+  const fallback = !a.blockText ? looseRange(text, a.text) : null;
+  return fallback ? [{ ...fallback, score: 0 }] : [];
 }
 
 /**
@@ -149,7 +166,8 @@ function looseRange(haystack: string, needle: string): { start: number; end: num
 
 /** 把块内 [start,end) 纯文本坐标范围包上高亮 span（跨行内元素时逐文本节点分段包） */
 export function wrapRangeInBlock(block: HTMLElement, start: number, end: number, cls: string, annId: string, color?: string): number {
-  const w = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  const doc = block.ownerDocument;
+  const w = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT);
   let pos = 0;
   let n: Node | null;
   const targets: Array<[Text, number, number]> = [];
@@ -165,10 +183,10 @@ export function wrapRangeInBlock(block: HTMLElement, start: number, end: number,
   let count = 0;
   for (const [node, s, e] of targets) {
     if (s >= e) continue;
-    const r = document.createRange();
+    const r = doc.createRange();
     r.setStart(node, s);
     r.setEnd(node, e);
-    const span = document.createElement("span");
+    const span = doc.createElement("span");
     span.className = cls;
     span.dataset.glossId = annId;
     if (color) {
@@ -189,7 +207,7 @@ export function unwrapAll(host: HTMLElement): void {
   for (const s of spans) {
     const parent = s.parentNode;
     if (!parent) continue;
-    const frag = document.createDocumentFragment();
+    const frag = host.ownerDocument.createDocumentFragment();
     while (s.firstChild) frag.appendChild(s.firstChild);
     parent.replaceChild(frag, s);
   }
@@ -202,8 +220,8 @@ export function unwrapAll(host: HTMLElement): void {
  * 从当前 DOM 选区构造 Markdown 锚点（预览/实时预览用）。
  * 返回锚点 + 选区 rect（用于浮泡定位）；不在有效块内返回 null。
  */
-export function selectionToMdAnchor(fallbackSel?: string): { anchor: MdAnchor; rect: DOMRect } | null {
-  const sel = window.getSelection();
+export function selectionToMdAnchor(fallbackSel?: string, doc: Document = document): { anchor: MdAnchor; rect: DOMRect } | null {
+  const sel = (doc.defaultView ?? window).getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
   const range = sel.getRangeAt(0);
   const rect = range.getBoundingClientRect();
