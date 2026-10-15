@@ -4,10 +4,11 @@
   "description": "Gloss — Word 风格页边批注 for Obsidian",
   "main": "main.js",
   "scripts": {
-    "dev": "node esbuild.config.mjs watch",
+    "dev": "node esbuild.config.mjs watch --deploy",
     "build": "npm run type && node esbuild.config.mjs production",
     "type": "tsc --noEmit",
-    "test": "node --test tests/*.test.cjs"
+    "test": "node --test tests/*.test.cjs",
+    "deploy": "npm run type && node esbuild.config.mjs production --deploy"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
