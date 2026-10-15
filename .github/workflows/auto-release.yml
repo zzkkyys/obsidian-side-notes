@@ -1,0 +1,90 @@
+name: Auto Release by Manifest Version
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - manifest.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gloss-release
+  cancel-in-progress: false
+
+jobs:
+  check-and-release:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Validate version and check release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const read = file => JSON.parse(readFileSync(file, 'utf8'));
+          const { version, minAppVersion } = read('manifest.json');
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+            throw new Error('manifest.version must be X.Y.Z without a v prefix');
+          }
+          const lock = read('package-lock.json');
+          if (read('package.json').version !== version || lock.version !== version
+              || lock.packages[''].version !== version || read('versions.json')[version] !== minAppVersion) {
+            throw new Error('Version files disagree. Use npm version patch --no-git-tag-version.');
+          }
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${version}`, {
+            headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' },
+          });
+          if (response.status !== 200 && response.status !== 404) {
+            throw new Error(`Release lookup failed: HTTP ${response.status}`);
+          }
+          if (response.status === 200 && (await response.json()).draft) {
+            throw new Error(`Release ${version} is a draft. Resolve it before retrying.`);
+          }
+          const exists = response.status === 200;
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nexists=${exists}\n`);
+          console.log(exists ? `Release ${version} already exists; skipping.` : `Preparing release ${version}.`);
+          NODE
+
+      - name: Install, test and build
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Create release and upload plugin
+        if: steps.release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            if [ "$(git rev-list -n 1 "refs/tags/$VERSION")" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $VERSION points to another commit. Refusing to publish mismatched assets."
+              exit 1
+            fi
+          fi
+          for file in main.js manifest.json styles.css versions.json; do
+            test -s "$file"
+          done
+          gh release create "$VERSION" main.js manifest.json styles.css versions.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$VERSION" --generate-notes
