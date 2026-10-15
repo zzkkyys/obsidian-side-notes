@@ -35,7 +35,8 @@ export class TypeManagerModal extends Modal {
       let dragged: string | null = null;
 
       const setOrder = (arr: GlossType[]) => {
-        arr.forEach((t, i) => { t.order = i; });
+        draft.splice(0, draft.length, ...arr);
+        draft.forEach((t, i) => { t.order = i; });
         persist();
         render();
       };
@@ -75,8 +76,7 @@ export class TypeManagerModal extends Modal {
         del.title = "删除类型（再点一次确认）";
         del.onclick = () => {
           if (del.dataset.arm) {
-            draft.splice(draft.findIndex(x => x.id === t.id), 1);
-            setOrder(draft);
+            setOrder(types.filter(x => x.id !== t.id));
           } else {
             del.dataset.arm = "1";
             del.addClass("gloss-armed");

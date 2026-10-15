@@ -69,3 +69,41 @@ test('a rejected editor save keeps the modal and its text, leaving the published
   assert.equal(lastComposer.input.value, 'several minutes of writing');
   assert.equal(entry.note.content, '');
 });
+
+
+for (const scenario of [
+  { name: 'new input in the sending card', otherCard: false, next: 'next reply' },
+  { name: 'a newly typed identical reply', otherCard: false, next: 'first reply' },
+  { name: 'new input in another card', otherCard: true, next: 'next reply from another card' },
+]) test(`successful reply save preserves ${scenario.name}`, async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const plugin = {};
+  const entry = { anchor: { text: 'quote' }, note: { id: 'pending-reply', content: '', attachments: [], replies: [], createdAt: 1 } };
+  const hooks = { async onChanged(next) { await gate; Object.assign(entry.note, next); }, async onDeleted() {} };
+  const build = () => m.exports.buildCard(plugin, entry, {}, 'doc.md', hooks);
+  const card = build(), ta = find(card, 'gloss-reply-ta');
+  ta.value = 'first reply'; ta.listeners.input();
+  const sending = find(card, 'gloss-reply-send').onclick();
+  const nextInput = scenario.otherCard ? find(build(), 'gloss-reply-ta') : ta;
+  nextInput.value = scenario.next; nextInput.listeners.input();
+  release(); await sending;
+  assert.equal(entry.note.replies.length, 1);
+  assert.equal(entry.note.replies[0].content, 'first reply');
+  assert.equal(nextInput.value, scenario.next);
+  assert.equal(find(build(), 'gloss-reply-ta').value, scenario.next);
+});
+
+test('sending an older card does not clear a newer shared draft that already exists', async () => {
+  const plugin = {};
+  const entry = { anchor: { text: 'quote' }, note: { id: 'older-card', content: '', attachments: [], replies: [], createdAt: 1 } };
+  const hooks = { async onChanged(next) { Object.assign(entry.note, next); }, async onDeleted() {} };
+  const build = () => m.exports.buildCard(plugin, entry, {}, 'doc.md', hooks);
+  const first = build(), ta = find(first, 'gloss-reply-ta');
+  ta.value = 'older reply'; ta.listeners.input();
+  const secondInput = find(build(), 'gloss-reply-ta');
+  secondInput.value = 'newer unsent draft'; secondInput.listeners.input();
+  await find(first, 'gloss-reply-send').onclick();
+  assert.equal(entry.note.replies[0].content, 'older reply');
+  assert.equal(find(build(), 'gloss-reply-ta').value, 'newer unsent draft');
+});

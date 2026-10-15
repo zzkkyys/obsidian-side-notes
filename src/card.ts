@@ -17,7 +17,7 @@ export interface CardHooks {
 /** 卡片内 Markdown 渲染的 Component 追踪（层被清空时统一 unload） */
 const compMap = new WeakMap<HTMLElement, Component[]>();
 // Same annotation object survives normal view refreshes; drafts are not persisted as replies.
-const replyDrafts = new WeakMap<GlossPlugin, Map<string, { text: string; open: boolean }>>();
+const replyDrafts = new WeakMap<GlossPlugin, Map<string, { text: string; open: boolean; revision: number }>>();
 const editing = new WeakMap<GlossPlugin, Set<string>>();
 
 export function disposeCompsUnder(root: HTMLElement): void {
@@ -52,7 +52,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   applyCardStyle(card, plugin.settings, type);
   card.addEventListener("dblclick", e => {
     const target = e.target;
-    if (!(target instanceof Element) || target.closest("button, a, input, textarea, select, summary, audio, video, img, [role=button], [contenteditable], .gloss-type-chip, .gloss-card-replies")) return;
+    if (!(target as Element | null)?.closest || (target as Element).closest("button, a, input, textarea, select, summary, audio, video, img, [role=button], [contenteditable], .gloss-type-chip, .gloss-card-replies")) return;
     e.preventDefault();
     e.stopPropagation();
     enterEdit();
@@ -213,7 +213,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   const rep = card.createDiv({ cls: "gloss-card-replies" });
   let drafts = replyDrafts.get(plugin);
   if (!drafts) { drafts = new Map(); replyDrafts.set(plugin, drafts); }
-  const replyDraft = drafts.get(key) ?? { text: "", open: false };
+  const replyDraft = drafts.get(key) ?? { text: "", open: false, revision: 0 };
   drafts.set(key, replyDraft);
   rep.hidden = !replyDraft.open;
   rep.id = `gloss-replies-${uuid()}`;
@@ -228,16 +228,25 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
   const inRow = rep.createDiv({ cls: "gloss-reply-row" });
   const ta = inRow.createEl("textarea", { cls: "gloss-reply-ta", placeholder: "回复讨论…（Enter 发送）" });
   ta.value = replyDraft.text;
-  ta.addEventListener("input", () => { replyDraft.text = ta.value; });
+  let inputRevision = 0;
+  ta.addEventListener("input", () => { inputRevision++; replyDraft.text = ta.value; replyDraft.revision++; });
   const send = inRow.createEl("button", { cls: "gloss-reply-send", text: "回复" });
   const doSend = async () => {
-    const v = ta.value.trim();
+    const submitted = ta.value;
+    const v = submitted.trim();
     if (!v || send.disabled) return;
+    const submittedInputRevision = inputRevision;
+    const submittedDraftRevision = replyDraft.revision;
     send.disabled = true;
     const next = copy();
     next.replies.push({ id: uuid(), content: v, createdAt: Date.now() }); next.updatedAt = Date.now();
     if (await change(next)) {
-      ta.value = ""; replyDraft.text = ""; replyDraft.open = true;
+      // A pending save must not erase later input in this card or another card sharing the draft.
+      if (inputRevision === submittedInputRevision && ta.value === submitted) ta.value = "";
+      if (replyDraft.revision === submittedDraftRevision && replyDraft.text === submitted) {
+        replyDraft.text = ""; replyDraft.revision++;
+      }
+      replyDraft.open = true;
       const row = rep.createDiv({ cls: "gloss-reply" }); row.setText(v);
       row.scrollIntoView?.({ block: "nearest" });
     }
@@ -279,7 +288,8 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
 let currentMenu: HTMLElement | null = null;
 let menuCleanup: (() => void) | null = null;
 
-export function closeTypeMenu(): void {
+export function closeTypeMenu(doc?: Document): void {
+  if (doc && currentMenu?.ownerDocument !== doc) return;
   menuCleanup?.(); menuCleanup = null;
   currentMenu?.remove();
   currentMenu = null;
@@ -287,7 +297,9 @@ export function closeTypeMenu(): void {
 
 export function showTypeMenu(plugin: GlossPlugin, anchorEl: HTMLElement, onPick: (id: string) => void): void {
   closeTypeMenu();
-  const menu = document.body.createDiv({ cls: "gloss-type-menu" });
+  const doc = anchorEl.ownerDocument;
+  const win = doc.defaultView ?? window;
+  const menu = doc.body.createDiv({ cls: "gloss-type-menu" });
   for (const t of plugin.storage.sortedTypes()) {
     const row = menu.createDiv({ cls: "gloss-type-row" });
     row.style.setProperty("--gloss-color", t.color);
@@ -298,17 +310,17 @@ export function showTypeMenu(plugin: GlossPlugin, anchorEl: HTMLElement, onPick:
     };
   }
   const r = anchorEl.getBoundingClientRect();
-  menu.style.left = `${Math.min(r.left, window.innerWidth - 180)}px`;
-  menu.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 40 * Math.max(1, plugin.storage.types.length))}px`;
+  menu.style.left = `${Math.min(r.left, win.innerWidth - 180)}px`;
+  menu.style.top = `${Math.min(r.bottom + 6, win.innerHeight - 40 * Math.max(1, plugin.storage.types.length))}px`;
   currentMenu = menu;
   const onDown = (e: MouseEvent) => {
     if (!menu.contains(e.target as Node)) {
       closeTypeMenu();
-      document.removeEventListener("mousedown", onDown, true);
+      doc.removeEventListener("mousedown", onDown, true);
     }
   };
-  const timer = setTimeout(() => { if (currentMenu === menu) document.addEventListener("mousedown", onDown, true); }, 0);
-  menuCleanup = () => { clearTimeout(timer); document.removeEventListener("mousedown", onDown, true); };
+  const timer = setTimeout(() => { if (currentMenu === menu) doc.addEventListener("mousedown", onDown, true); }, 0);
+  menuCleanup = () => { clearTimeout(timer); doc.removeEventListener("mousedown", onDown, true); };
 }
 
 /** 取库内文件的可访问 URL（getResourcePath 需要 TFile） */

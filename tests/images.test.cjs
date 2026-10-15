@@ -156,3 +156,22 @@ test('upload completion preserves a caret that the user moved elsewhere', async 
   assert.equal(h.ta.selectionStart, 2); assert.equal(h.ta.selectionEnd, 2);
   assert.ok(h.ta.value.includes('images/new.png'));
 });
+
+
+test('percent escapes and spaces identify distinct attachments in Markdown and Wiki references', () => {
+  const literal = { id: 'literal', kind: 'image', name: 'my%20photo.png', path: 'images/my%20photo.png' };
+  const spaced = { id: 'spaced', kind: 'image', name: 'my photo.png', path: 'images/my photo.png' };
+  for (const [target, other] of [[literal, spaced], [spaced, literal]]) {
+    for (const reference of [imageMarkdown(target), `![[${target.path}]]`]) {
+      assert.equal(isInline(reference, target), true);
+      assert.equal(isInline(reference, other), false);
+      assert.equal(removeInline(reference, other), reference);
+      assert.equal(removeInline(reference, target), '');
+      assert.equal(moduleImage.exports.moveImageReferences(reference, other, 'moved.png'), reference);
+      assert.equal(moduleImage.exports.moveImageReferences(reference, target, 'moved.png'), imageMarkdown({ ...target, path: 'moved.png' }));
+      for (const attachments of [[literal, spaced], [spaced, literal]]) {
+        assert.equal(moduleImage.exports.renderImageReferences(reference, attachments, a => `app://${a.id}`), `![${target.name}](<app://${target.id}>)`);
+      }
+    }
+  }
+});

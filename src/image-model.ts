@@ -13,8 +13,11 @@ function references(content: string, a: GlossAttachment): string[] {
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(content))) {
     let path = match[1] ?? match[2] ?? match[3];
-    if (path === a.path) { refs.push(match[0]); continue; }
-    try { path = decodeURIComponent(path); } catch { /* Literal percent in legacy vault paths. */ }
+    // Markdown destinations are URLs; Wiki embeds name literal vault paths.
+    // Matching both raw and decoded URLs aliases "my%20photo.png" to "my photo.png".
+    if (match[3] === undefined) {
+      try { path = decodeURIComponent(path); } catch { /* Keep malformed percent escapes literal. */ }
+    }
     if (path === a.path) refs.push(match[0]);
   }
   return refs;
