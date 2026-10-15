@@ -67,6 +67,9 @@ export class GlossStorage {
   private recovering = new Set<string>();
   onStatusChange: () => void = () => {};
   private activePaths: Set<string> | null = null;
+  /** 批量附件更新持有枚举到的 store；连续改名串行完成后才允许驱逐。 */
+  private attachmentMoves = 0;
+  private attachmentMoveChain: Promise<void> = Promise.resolve();
   setActivePaths(paths: string[]): void { this.activePaths = new Set(paths); }
   get problems(): string[] { return [...new Set([...this.conflicts.keys(), ...this.errors.keys()])]; }
   get hasProblems(): boolean { return this.problems.length > 0; }
@@ -92,11 +95,12 @@ export class GlossStorage {
     let raw: string | null = null;
     let fileExisted = false;
     let checkFailed = false;
+    let cloudPlaceholder = false;
     try {
       if (await this.app.vault.adapter.exists(TYPES_PATH)) {
         fileExisted = true;
         raw = await this.app.vault.adapter.read(TYPES_PATH);
-      }
+      } else cloudPlaceholder = await this.hasCloudPlaceholder(TYPES_PATH);
     } catch { checkFailed = true; } // exists/read 抛异常：状态未知，按"读不出来"保守处理
     this.typesBaseline = checkFailed ? undefined : raw;
     this.typesLoaded = true;
@@ -121,14 +125,14 @@ export class GlossStorage {
       new Notice("Gloss：批注类型文件损坏，已临时使用默认类型（原文件未覆盖）");
       return this.types;
     }
-    if (fileExisted || checkFailed) {
+    if (fileExisted || checkFailed || cloudPlaceholder) {
       // 存在但读不出来（read 失败 / 空内容 / 探测抛异常）：同样禁止覆盖
       this.typesFailed = true;
       new Notice("Gloss：批注类型文件不可读，已临时使用默认类型（原文件未覆盖）");
     }
     this.types = defaultTypes();
     // 缺失不等于首次安装：同步可能临时移走文件。初始化只读默认值，用户修改时才保存。
-    if (!fileExisted && !checkFailed) {
+    if (!fileExisted && !checkFailed && !cloudPlaceholder) {
       try {
         const existing = await this.app.vault.adapter.list(ANN_DIR);
         if (existing.files.length || existing.folders.length) {
@@ -190,6 +194,12 @@ export class GlossStorage {
     return await this.app.vault.adapter.exists(path) ? this.app.vault.adapter.read(path) : null;
   }
 
+  private async hasCloudPlaceholder(path: string): Promise<boolean> {
+    const slash = path.lastIndexOf("/");
+    const hidden = path.slice(0, slash + 1) + "." + path.slice(slash + 1) + ".icloud";
+    return await this.app.vault.adapter.exists(hidden) || await this.app.vault.adapter.exists(path + ".icloud");
+  }
+
   /** Adapter polling also works for hidden folders where ordinary Vault events do not fire. */
   async checkExternalChanges(): Promise<boolean> {
     if (this.checkingExternal || this.migrationBarrier) return false;
@@ -197,7 +207,7 @@ export class GlossStorage {
     let changed = false;
     try {
       for (const state of this.docs.values()) {
-        if (this.activePaths && !this.activePaths.has(state.path) && !this.isBusy(state) && !state.load && !this.conflicts.has(this.docJsonPath(state.path)) && !this.errors.has(this.docJsonPath(state.path))) {
+        if (!this.attachmentMoves && this.activePaths && !this.activePaths.has(state.path) && !this.isBusy(state) && !state.load && !this.conflicts.has(this.docJsonPath(state.path)) && !this.errors.has(this.docJsonPath(state.path))) {
           if (state.store) this.storeState.delete(state.store);
           this.docs.delete(state.path); continue;
         }
@@ -397,15 +407,13 @@ export class GlossStorage {
       // 探测抛异常时状态未知，新文件可能实际存在，迁移会覆盖它
       if (!fileExisted && !readFailed) {
         const json = this.docJsonPath(docPath);
-        const slash = json.lastIndexOf("/");
-        const placeholder = json.slice(0, slash + 1) + "." + json.slice(slash + 1) + ".icloud";
         try {
-        if (typeof state.baseline === "string" || await this.app.vault.adapter.exists(placeholder) || await this.app.vault.adapter.exists(json + ".icloud")) {
-          readFailed = true;
-        } else {
-        store = await this.tryLegacyMigration(docPath);
-        state.baseline = await this.diskText(this.docJsonPath(docPath));
-        }
+          if (typeof state.baseline === "string" || await this.hasCloudPlaceholder(json)) {
+            readFailed = true;
+          } else {
+            store = await this.tryLegacyMigration(docPath);
+            state.baseline = await this.diskText(json);
+          }
         } catch { readFailed = true; }
       }
     }
@@ -441,27 +449,28 @@ export class GlossStorage {
     const newPath = this.docJsonPath(docPath);
     const legacy = `${ANN_DIR}/${legacySafePath(docPath)}.json`;
     if (legacy === newPath) return null;
+    // 读取/解析失败必须传给 readDocStore，不能当成无批注的新文档。
+    if (!(await this.app.vault.adapter.exists(legacy))) {
+      if (await this.hasCloudPlaceholder(legacy)) throw new Error(`旧批注尚未下载：${legacy}`);
+      return null;
+    }
+    const raw = await this.app.vault.adapter.read(legacy);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.docPath !== "string" || !Array.isArray(parsed.entries)) throw new Error(`旧批注格式无效：${legacy}`);
+    if (parsed.docPath !== docPath) {
+      console.warn(`[Gloss] 跳过 ${legacy}：其 docPath 为 ${parsed.docPath}，不属于 ${docPath}`);
+      return null;
+    }
+    const store = parsed as GlossDocStore;
+    store.docPath = docPath;
     try {
-      if (!(await this.app.vault.adapter.exists(legacy))) return null;
-      const raw = await this.app.vault.adapter.read(legacy);
-      const parsed = JSON.parse(raw);
-      if (!parsed || !Array.isArray(parsed.entries)) return null;
-      if (parsed.docPath !== docPath) {
-        console.warn(`[Gloss] 跳过 ${legacy}：其 docPath 为 ${parsed.docPath}，不属于 ${docPath}`);
-        return null;
-      }
-      const store = parsed as GlossDocStore;
-      store.docPath = docPath;
-      try {
-        await this.ensureParent(newPath);
-        await this.app.vault.adapter.write(newPath, JSON.stringify(store, null, 2));
-        await this.app.vault.adapter.remove(legacy);
-      } catch (error) {
-        console.warn(`[Gloss] 旧批注可读，迁移稍后重试：${legacy}`, error);
-      }
-      return store;
-    } catch { /* ignore */ }
-    return null;
+      await this.ensureParent(newPath);
+      await this.app.vault.adapter.write(newPath, JSON.stringify(store, null, 2));
+      await this.app.vault.adapter.remove(legacy);
+    } catch (error) {
+      console.warn(`[Gloss] 旧批注可读，迁移稍后重试：${legacy}`, error);
+    }
+    return store;
   }
 
   /** 是否有未落盘的改动：防抖定时器（含延迟重排）、在途写入、或尚未写成功的脏状态 */
@@ -628,20 +637,33 @@ export class GlossStorage {
     return removed;
   }
 
-  async moveAttachments(oldPath: string, newPath: string, folder = false): Promise<void> {
-    const documents = await this.listAll();
-    for (const { store } of documents) for (const entry of [...store.entries]) {
-      const matches = entry.note.attachments.filter(a => a.path === oldPath || (folder && a.path.startsWith(oldPath + "/")));
-      if (!matches.length) continue;
-      const next: GlossEntry = JSON.parse(JSON.stringify(entry));
-      for (const attachment of matches) {
-        const path = newPath + attachment.path.slice(oldPath.length);
-        next.note.content = moveImageReferences(next.note.content, attachment, path);
-        next.note.attachments.find(a => a.id === attachment.id)!.path = path;
+  moveAttachments(oldPath: string, newPath: string, folder = false): Promise<void> {
+    this.attachmentMoves++;
+    const task = this.attachmentMoveChain.then(async () => {
+      let documents: Array<{ path: string; store: GlossDocStore }>;
+      for (;;) {
+        await this.waitForMigrations();
+        const migrations = this.migrations;
+        documents = await this.listAll();
+        // listAll may have collected old paths before a folder migration changed their identity.
+        // Re-enumerate after that migration; never make migrations wait on the attachment queue.
+        if (migrations === this.migrations) break;
       }
-      next.note.updatedAt = Date.now();
-      await this.commitEntry(store, entry.note.id, next, JSON.stringify(entry.note));
-    }
+      for (const { store } of documents) for (const entry of [...store.entries]) {
+        const matches = entry.note.attachments.filter(a => a.path === oldPath || (folder && a.path.startsWith(oldPath + "/")));
+        if (!matches.length) continue;
+        const next: GlossEntry = JSON.parse(JSON.stringify(entry));
+        for (const attachment of matches) {
+          const path = newPath + attachment.path.slice(oldPath.length);
+          next.note.content = moveImageReferences(next.note.content, attachment, path);
+          next.note.attachments.find(a => a.id === attachment.id)!.path = path;
+        }
+        next.note.updatedAt = Date.now();
+        await this.commitEntry(store, entry.note.id, next, JSON.stringify(entry.note));
+      }
+    }).finally(() => { this.attachmentMoves--; });
+    this.attachmentMoveChain = task.catch(() => undefined);
+    return task;
   }
 
   /** 删除源文档时归档批注；新建同名笔记不继承旧身份。归档失败不删除原 JSON。 */
@@ -823,6 +845,7 @@ export class GlossStorage {
 
   /** 插件卸载前把所有防抖写盘落盘（含类型防抖）；单文档失败不中断其余 */
   async flushAll(): Promise<void> {
+    await this.attachmentMoveChain;
     await this.waitForMigrations();
     for (const state of this.docs.values()) {
       if (state.timer) { clearTimeout(state.timer); state.timer = null; }

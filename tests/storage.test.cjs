@@ -381,3 +381,175 @@ test('draft cleanup keeps all uploads if even one reference file cannot be read'
   await f.storage.cleanupDraftUploads(['gloss-attachments/n/new.png']);
   assert.ok(f.disk.has('gloss-attachments/n/new.png'));
 });
+
+
+test('legacy read, probe and format failures stay read-only until the original data is readable', async t => {
+  for (const failure of ['read', 'exists', 'json', 'shape']) await t.test(failure, async () => {
+    const p = 'folder/a.md', legacy = '.gloss/annotations/folder__a.md.json', original = raw(p, 'OLD');
+    const f = fixture({ [legacy]: original });
+    const read = f.adapter.read, exists = f.adapter.exists;
+    if (failure === 'read') f.adapter.read = path => path === legacy ? Promise.reject(Error('offline')) : read(path);
+    if (failure === 'exists') f.adapter.exists = path => path === legacy ? Promise.reject(Error('offline')) : exists(path);
+    if (failure === 'json') f.disk.set(legacy, '{incomplete');
+    if (failure === 'shape') f.disk.set(legacy, JSON.stringify({ docPath: p, entries: null }));
+    const before = f.disk.get(legacy), store = await f.storage.loadDoc(p);
+    assert.equal(f.storage.saveStore(store), false);
+    await assert.rejects(f.storage.createEntry(p, note('NEW')));
+    await f.storage.flushAll();
+    assert.equal(f.disk.get(legacy), before);
+    assert.equal(f.disk.has(jsonPath(p)), false);
+    f.adapter.read = read; f.adapter.exists = exists; f.disk.set(legacy, original);
+    f.storage.invalidate(p);
+    assert.deepEqual(ids(await f.storage.loadDoc(p)), ['OLD']);
+    await f.storage.createEntry(p, note('NEW'));
+    assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['OLD', 'NEW']);
+  });
+});
+
+test('a valid legacy collision remains owned by its declared document', async () => {
+  const legacy = '.gloss/annotations/folder__a.md.json', original = raw('folder__a.md', 'FOREIGN');
+  const f = fixture({ [legacy]: original });
+  await f.storage.createEntry('folder/a.md', note('NEW'));
+  assert.equal(f.disk.get(legacy), original);
+  assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath('folder/a.md')))), ['NEW']);
+});
+
+test('type cloud placeholders block saves and downloaded types become editable after polling', async t => {
+  for (const placeholder of ['.gloss/.types.json.icloud', '.gloss/types.json.icloud']) await t.test(placeholder, async () => {
+    const f = fixture({ [placeholder]: 'placeholder' });
+    await f.storage.loadTypes();
+    assert.equal(f.storage.canEditTypes, false);
+    await assert.rejects(f.storage.saveTypesSnapshot([], JSON.stringify(f.storage.types)));
+    f.storage.saveTypes(); await f.storage.flushAll();
+    assert.equal(f.disk.has('.gloss/types.json'), false);
+    const remote = [{ id: 'remote', name: 'Remote', color: '#123456', order: 0 }];
+    f.disk.set('.gloss/types.json', JSON.stringify(remote)); f.disk.delete(placeholder);
+    assert.equal(await f.storage.checkExternalChanges(), true);
+    assert.equal(f.storage.canEditTypes, true);
+    assert.equal(f.storage.types[0].id, 'remote');
+    await f.storage.saveTypesSnapshot([], JSON.stringify(f.storage.types));
+    assert.equal(f.disk.get('.gloss/types.json'), '[]');
+  });
+});
+
+function attachmentDoc(p, id) {
+  const entry = note(id);
+  entry.note.attachments = [{ id: 'pic', kind: 'image', path: 'old/a.png', name: 'a.png' }];
+  entry.note.content = '![[old/a.png]]';
+  return JSON.stringify({ version: 1, docPath: p, kind: 'md', entries: [entry] });
+}
+
+test('polling does not evict closed documents held by a batch attachment rename', async () => {
+  const f = fixture({ [jsonPath('a.md')]: attachmentDoc('a.md', 'A'), [jsonPath('b.md')]: attachmentDoc('b.md', 'B') });
+  f.storage.setActivePaths([]);
+  const gate = deferred(), started = deferred(), write = f.adapter.write;
+  f.adapter.write = async (p, value) => { if (p === jsonPath('a.md')) { started.resolve(); await gate.promise; } return write(p, value); };
+  const move = f.storage.moveAttachments('old/a.png', 'new/a.png');
+  await started.promise; await f.storage.checkExternalChanges(); gate.resolve(); await move;
+  for (const p of ['a.md', 'b.md']) {
+    const saved = JSON.parse(f.disk.get(jsonPath(p))).entries[0].note;
+    assert.equal(saved.attachments[0].path, 'new/a.png');
+    assert.ok(saved.content.includes('new/a.png'));
+  }
+  await f.storage.checkExternalChanges();
+  assert.equal(f.storage.docCacheFor('a.md'), undefined);
+  assert.equal(f.storage.docCacheFor('b.md'), undefined);
+});
+
+test('consecutive attachment renames serialize and survive polling between writes', async () => {
+  const f = fixture({ [jsonPath('a.md')]: attachmentDoc('a.md', 'A'), [jsonPath('b.md')]: attachmentDoc('b.md', 'B') });
+  f.storage.setActivePaths([]);
+  const gate = deferred(), started = deferred(), write = f.adapter.write; let first = true;
+  f.adapter.write = async (p, value) => {
+    if (p === jsonPath('a.md') && first) { first = false; started.resolve(); await gate.promise; }
+    return write(p, value);
+  };
+  const one = f.storage.moveAttachments('old/a.png', 'new/a.png'); await started.promise;
+  const two = f.storage.moveAttachments('new/a.png', 'final/a.png');
+  await f.storage.checkExternalChanges(); gate.resolve(); await Promise.all([one, two]);
+  for (const p of ['a.md', 'b.md']) assert.equal(JSON.parse(f.disk.get(jsonPath(p))).entries[0].note.attachments[0].path, 'final/a.png');
+});
+
+test('a failed batch attachment rename releases retained stores and does not block the next rename', async () => {
+  const f = fixture({ [jsonPath('a.md')]: attachmentDoc('a.md', 'A') });
+  f.storage.setActivePaths([]);
+  const write = f.adapter.write;
+  f.adapter.write = async () => { throw Error('disk full'); };
+  await assert.rejects(f.storage.moveAttachments('old/a.png', 'new/a.png'));
+  f.adapter.write = write;
+  await f.storage.moveAttachments('old/a.png', 'final/a.png');
+  assert.equal(JSON.parse(f.disk.get(jsonPath('a.md'))).entries[0].note.attachments[0].path, 'final/a.png');
+  await f.storage.checkExternalChanges();
+  assert.equal(f.storage.docCacheFor('a.md'), undefined);
+});
+
+
+test('batch attachment updates preserve an external edit made before its document is committed', async () => {
+  const f = fixture({ [jsonPath('a.md')]: attachmentDoc('a.md', 'A'), [jsonPath('b.md')]: attachmentDoc('b.md', 'B') });
+  f.storage.setActivePaths([]);
+  const gate = deferred(), started = deferred(), write = f.adapter.write;
+  f.adapter.write = async (p, value) => { if (p === jsonPath('a.md')) { started.resolve(); await gate.promise; } return write(p, value); };
+  const move = f.storage.moveAttachments('old/a.png', 'new/a.png');
+  await started.promise;
+  const remote = raw('b.md', 'REMOTE'); f.disk.set(jsonPath('b.md'), remote);
+  await f.storage.checkExternalChanges(); gate.resolve();
+  await assert.rejects(move);
+  assert.equal(f.disk.get(jsonPath('b.md')), remote);
+});
+
+test('flushAll waits for an attachment batch that has not finished enumerating documents', async () => {
+  const f = fixture({ [jsonPath('a.md')]: attachmentDoc('a.md', 'A'), [jsonPath('b.md')]: attachmentDoc('b.md', 'B') });
+  const gate = deferred(), started = deferred(), list = f.adapter.list;
+  f.adapter.list = async p => { if (p === '.gloss/annotations') { started.resolve(); await gate.promise; } return list(p); };
+  const move = f.storage.moveAttachments('old/a.png', 'new/a.png'); await started.promise;
+  let flushed = false;
+  const flushing = f.storage.flushAll().then(() => { flushed = true; });
+  await new Promise(setImmediate);
+  assert.equal(flushed, false);
+  gate.resolve(); await Promise.all([move, flushing]);
+  for (const p of ['a.md', 'b.md']) assert.equal(JSON.parse(f.disk.get(jsonPath(p))).entries[0].note.attachments[0].path, 'new/a.png');
+});
+
+
+test('attachment batches re-enumerate documents migrated while their paths are being collected', { timeout: 2000 }, async () => {
+  const oldPath = 'old/n.md', newPath = 'new/n.md';
+  const f = fixture({ [jsonPath(oldPath)]: attachmentDoc(oldPath, 'A') });
+  await f.storage.loadDoc(oldPath);
+  const gate = deferred(), started = deferred(), read = f.adapter.read;
+  let first = true;
+  f.adapter.read = async p => {
+    const value = await read(p);
+    if (p === jsonPath(oldPath) && first) { first = false; started.resolve(); await gate.promise; }
+    return value;
+  };
+  const move = f.storage.moveAttachments('old', 'new', true);
+  await started.promise;
+  gate.resolve();
+  const migration = f.storage.migrateDoc(oldPath, newPath);
+  const flushing = f.storage.flushAll();
+  const [, migrated] = await Promise.all([move, migration, flushing]);
+  assert.equal(migrated, true);
+  const saved = JSON.parse(f.disk.get(jsonPath(newPath))).entries[0].note;
+  assert.equal(saved.attachments[0].path, 'new/a.png');
+  assert.ok(saved.content.includes('new/a.png'));
+  assert.equal(f.disk.has(jsonPath(oldPath)), false);
+});
+
+
+test('legacy cloud placeholders prevent a new annotation file from shadowing undownloaded data', async t => {
+  const p = 'folder/a.md', legacy = '.gloss/annotations/folder__a.md.json';
+  for (const placeholder of ['.gloss/annotations/.folder__a.md.json.icloud', legacy + '.icloud']) await t.test(placeholder, async () => {
+    const f = fixture({ [placeholder]: 'placeholder' });
+    const store = await f.storage.loadDoc(p);
+    assert.equal(f.storage.saveStore(store), false);
+    await assert.rejects(f.storage.createEntry(p, note('NEW')));
+    await f.storage.flushAll();
+    assert.equal(f.disk.has(jsonPath(p)), false);
+    assert.equal(f.disk.get(placeholder), 'placeholder');
+    f.disk.set(legacy, raw(p, 'OLD')); f.disk.delete(placeholder);
+    f.storage.invalidate(p);
+    assert.deepEqual(ids(await f.storage.loadDoc(p)), ['OLD']);
+    await f.storage.createEntry(p, note('NEW'));
+    assert.deepEqual(ids(JSON.parse(f.disk.get(jsonPath(p)))), ['OLD', 'NEW']);
+  });
+});
