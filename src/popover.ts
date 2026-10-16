@@ -152,10 +152,12 @@ export function openCreatePopover(plugin: GlossPlugin, opts: CreatePopoverOption
   };
 
   ta.onkeydown = e => {
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save.click(); }
   };
   positionPopover(pop, opts.rect);
   const onKey = (event: KeyboardEvent) => {
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || composer.handleSuggestionKeydown(event)) return;
     if (event.key !== "Escape" || doc.querySelector(".gloss-image-viewer")) return;
     event.preventDefault(); event.stopPropagation();
     if (!ta.value.trim() && attachments.length === 0 && !composer.hasPending() && !save.disabled) dismiss();
@@ -189,6 +191,7 @@ function positionPopover(pop: HTMLElement, rect: DOMRect): void {
   let y = rect.bottom + 10;
   if (y + h > win.innerHeight - 8) y = Math.max(8, rect.top - h - 10);
   pop.style.top = `${y}px`;
+  pop.style.maxHeight = `${Math.max(0, win.innerHeight - y - 8)}px`;
 }
 
 // ---------- 气泡模式（窄屏点高亮弹出） ----------

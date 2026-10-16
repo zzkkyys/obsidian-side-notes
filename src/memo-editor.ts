@@ -1,19 +1,21 @@
+import { attachNoteSuggest } from "./note-suggest";
 import { bindAttachmentLinks, renderAttachmentLinks } from "./attachment-open";
-import { Component, MarkdownRenderer, Notice } from "obsidian";
+import { Component, MarkdownRenderer, Notice, type Scope } from "obsidian";
 import type GlossPlugin from "./main";
 import type { GlossAttachment } from "./types";
 import { imageComposer, renderGallery } from "./images";
 import { renderImageReferences } from "./image-model";
 
 /** One draft surface for creation and editing; textarea values must be assigned as properties on older Obsidian. */
-export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initial: string, noteId: string, attachments: GlossAttachment[], docPath: string) {
+export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initial: string, noteId: string, attachments: GlossAttachment[], docPath: string, parentScope?: Scope) {
   const shell = parent.createDiv({ cls: "gloss-memo-editor" });
   const tabs = shell.createDiv({ cls: "gloss-memo-tabs" });
   const edit = tabs.createEl("button", { text: "编辑", attr: { "aria-pressed": "true" } });
   const previewButton = tabs.createEl("button", { text: "预览", attr: { "aria-pressed": "false" } });
   const input = shell.createEl("textarea", { cls: "gloss-memo-input", attr: { "aria-label": "批注正文（支持 Markdown）" } });
   input.value = initial;
-  input.placeholder = "写下你的想法…";
+  input.placeholder = "写下你的想法… 输入 [[ 链接笔记";
+  const suggestions = attachNoteSuggest(plugin.app, input, shell, docPath, parentScope);
   const preview = shell.createDiv({ cls: "gloss-memo-preview gloss-card-body" });
   preview.hidden = true;
   const composer = imageComposer(plugin, shell, input, noteId, attachments);
@@ -31,6 +33,7 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
     input.focus();
   };
   previewButton.onclick = async () => {
+    suggestions.close();
     clearPreview();
     const seq = token;
     input.hidden = true; preview.hidden = false; composer.gallery.hidden = true;
@@ -61,9 +64,10 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
   };
   return {
     input, buttons,
+    handleSuggestionKeydown: suggestions.handleKeydown,
     ready: composer.ready,
     hasPending: composer.hasPending,
-    freeze(value: boolean): void { composer.freeze(value); previewButton.disabled = value; edit.disabled = value; },
-    dispose(): void { disposed = true; clearPreview(); composer.dispose(); },
+    freeze(value: boolean): void { suggestions.freeze(value); composer.freeze(value); previewButton.disabled = value; edit.disabled = value; },
+    dispose(): void { disposed = true; suggestions.dispose(); clearPreview(); composer.dispose(); },
   };
 }

@@ -49,7 +49,7 @@ function popHarness() {
       name === './card-style' ? { applyCardStyle() {} } : name === 'obsidian' ? { Notice: class {} } :
       name === './memo-editor' ? { createMemoEditor(_plugin, parent) {
         const input = parent.createEl('textarea'), buttons = parent.createDiv();
-        return composer = { input, buttons, ready: () => ready, hasPending: () => false, freeze() {}, dispose() { this.disposed = true; } };
+        return composer = { input, buttons, handleSuggestionKeydown: () => false, ready: () => ready, hasPending: () => false, freeze() {}, dispose() { this.disposed = true; } };
       } } : {} });
   const opts = { docPath: 'note.md', anchor: { kind: 'md', text: 'quote' }, rect: { left: 300, width: 100, top: 200, bottom: 220 }, document: secondary, onClosed() {} };
   return { ...exports, main, secondary, callbacks, plugin, opts, get composer() { return composer; }, get creates() { return creates; }, set ready(promise) { ready = promise; } };

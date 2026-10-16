@@ -129,7 +129,7 @@ test('memo editor restores existing multiline content on Obsidian versions ignor
   }
   const m = { exports: {} };
   const source = ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname, '../src/memo-editor.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 } }).outputText;
-  vm.runInNewContext(source, { module: m, exports: m.exports, require: name => name === './image-model' ? moduleImage.exports : name === './images' ? {
+  vm.runInNewContext(source, { module: m, exports: m.exports, require: name => name === './note-suggest' ? { attachNoteSuggest: () => ({ close() {}, handleKeydown() {}, freeze() {}, dispose() {} }) } : name === './image-model' ? moduleImage.exports : name === './images' ? {
     imageComposer: () => ({ actions: new LegacyElement(), gallery: new LegacyElement(), ready: async () => {}, freeze() {}, dispose() {} }),
     renderGallery() {},
   } : {} });

@@ -768,3 +768,14 @@
   .gloss-card-control, .gloss-reply-toggle { opacity: 1; visibility: visible; }
   .gloss-card-head button, .gloss-card-foot button, .gloss-pill { min-width: 44px; min-height: 44px; }
 }
+
+
+/* Note links stay in the draft: no overlay outside a modal or narrow popover. */
+.gloss-note-suggest { border-top: 1px solid var(--background-modifier-border); background: var(--background-secondary); }
+.gloss-note-suggest-list { position: relative; max-height: min(220px, 30vh); overflow-y: auto; overscroll-behavior: contain; }
+.gloss-note-suggest-option { min-height: 44px; box-sizing: border-box; padding: 7px 16px; border-left: 3px solid transparent; cursor: pointer; }
+.gloss-note-suggest-option[aria-selected="true"] { border-left-color: var(--interactive-accent); background: var(--background-modifier-hover); }
+.gloss-note-suggest-name { color: var(--text-normal); font-size: 14px; line-height: 1.4; }
+.gloss-note-suggest-path { color: var(--text-muted); font-size: 12px; line-height: 1.4; }
+.gloss-note-suggest-name, .gloss-note-suggest-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gloss-note-suggest-hint { padding: 7px 16px; border-top: 1px solid var(--background-modifier-border); color: var(--text-muted); font-size: 12px; line-height: 1.5; }

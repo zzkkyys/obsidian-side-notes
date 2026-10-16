@@ -144,7 +144,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
     modal.modalEl.addClass("gloss-editor-modal");
     const draft = note.attachments.map(a => ({ ...a }));
     modal.contentEl.createDiv({ cls: "gloss-memo-context", text: entry.anchor.text || "所选区域" });
-    const composer = createMemoEditor(plugin, modal.contentEl, note.content, note.id, draft, docPath);
+    const composer = createMemoEditor(plugin, modal.contentEl, note.content, note.id, draft, docPath, modal.scope);
     const ta = composer.input;
     modal.onClose = () => { active!.delete(key); composer.dispose(); };
     const row = composer.buttons;
@@ -165,6 +165,7 @@ export function buildCard(plugin: GlossPlugin, entry: GlossEntry, type: GlossTyp
       finally { save.disabled = cancel.disabled = false; save.setText("保存批注"); composer.freeze(false); }
     };
     ta.onkeydown = e => {
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save.click(); }
     };
     openImageModal(plugin, modal);
