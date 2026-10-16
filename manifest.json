@@ -1,7 +1,7 @@
 {
   "id": "gloss",
   "name": "Gloss",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.4.0",
   "description": "Word 风格页边批注：选中文字添加结构化批注卡片，连线与高亮一一对应；支持 Markdown 与 PDF、图片与文件附件、回复讨论。",
   "author": "zky",

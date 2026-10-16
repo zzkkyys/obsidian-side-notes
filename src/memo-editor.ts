@@ -14,7 +14,7 @@ export function createMemoEditor(plugin: GlossPlugin, parent: HTMLElement, initi
   const previewButton = tabs.createEl("button", { text: "预览", attr: { "aria-pressed": "false" } });
   const input = shell.createEl("textarea", { cls: "gloss-memo-input", attr: { "aria-label": "批注正文（支持 Markdown）" } });
   input.value = initial;
-  input.placeholder = "写下你的想法… 输入 [[ 链接笔记";
+  input.placeholder = "写下你的想法… 输入 [[ 链接笔记或附件";
   const suggestions = attachNoteSuggest(plugin.app, input, shell, docPath, parentScope);
   const preview = shell.createDiv({ cls: "gloss-memo-preview gloss-card-body" });
   preview.hidden = true;

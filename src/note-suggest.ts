@@ -1,15 +1,28 @@
 import { parseFrontMatterAliases, Scope, type App, type TFile } from "obsidian";
 import { completeWikiLink, findWikiLinkContext, type WikiLinkContext } from "./note-link-model";
 
-/** Search Obsidian's in-memory index; filenames and paths remain distinct for duplicate notes. */
+const imageExtensions = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
+const videoExtensions = new Set(["mkv", "mov", "mp4", "ogv", "webm"]);
+
+function candidateKind(file: TFile): string | null {
+  const extension = file.extension.toLowerCase();
+  if (extension === "md") return "笔记";
+  if (imageExtensions.has(extension)) return "图片";
+  if (extension === "pdf") return "PDF";
+  if (videoExtensions.has(extension)) return "视频";
+  return null;
+}
+
+/** Search indexed vault files without reading media bytes or scanning hidden folders. */
 export function findNoteCandidates(app: App, query: string, limit = 12): TFile[] {
   const q = query.trim().toLocaleLowerCase();
   const words = q.split(/\s+/).filter(Boolean);
-  return app.vault.getMarkdownFiles().map(file => {
-    const name = file.basename.toLocaleLowerCase(), path = file.path.toLocaleLowerCase();
-    const aliases = (parseFrontMatterAliases(app.metadataCache.getFileCache(file)?.frontmatter) ?? []).map(a => a.toLocaleLowerCase());
+  return app.vault.getFiles().filter(file => candidateKind(file) !== null).map(file => {
+    const name = file.basename.toLocaleLowerCase(), filename = file.name.toLocaleLowerCase(), path = file.path.toLocaleLowerCase();
+    const aliases = file.extension.toLowerCase() === "md"
+      ? (parseFrontMatterAliases(app.metadataCache.getFileCache(file)?.frontmatter) ?? []).map(a => a.toLocaleLowerCase()) : [];
     const haystack = [name, path, ...aliases].join(" ");
-    const score = !q ? 0 : name === q ? 0 : name.startsWith(q) ? 1 : aliases.includes(q) ? 2 : path.startsWith(q) ? 3 : 4;
+    const score = !q ? 0 : (name === q || filename === q) ? 0 : (name.startsWith(q) || filename.startsWith(q)) ? 1 : aliases.includes(q) ? 2 : path.startsWith(q) ? 3 : 4;
     return { file, score, matches: words.every(word => haystack.includes(word)) };
   }).filter(item => item.matches).sort((a, b) => a.score - b.score
     || (!q ? b.file.stat.mtime - a.file.stat.mtime : 0) || a.file.path.localeCompare(b.file.path))
@@ -26,7 +39,7 @@ export function attachNoteSuggest(app: App, input: HTMLTextAreaElement, host: HT
   list.className = "gloss-note-suggest-list";
   list.id = `gloss-note-suggest-${Math.random().toString(36).slice(2)}`;
   list.setAttribute("role", "listbox");
-  list.setAttribute("aria-label", "链接到笔记");
+  list.setAttribute("aria-label", "链接到笔记或附件");
   const status = doc.createElement("div");
   status.className = "gloss-note-suggest-hint";
   status.setAttribute("role", "status");
@@ -65,7 +78,7 @@ export function attachNoteSuggest(app: App, input: HTMLTextAreaElement, host: HT
     if (disposed || frozen || composing || !input.isConnected || snapshot !== input.value) { close(); return; }
     const current = findWikiLinkContext(input.value, input.selectionStart, input.selectionEnd);
     if (!current || !context || current.start !== context.start || current.end !== context.end || current.query !== context.query) { close(); return; }
-    const live = app.vault.getMarkdownFiles().find(f => f.path === file.path);
+    const live = app.vault.getFiles().find(f => f.path === file.path && candidateKind(f) !== null);
     if (!live) { update(); return; }
     const linktext = app.metadataCache.fileToLinktext(live, sourcePath, true);
     const completed = completeWikiLink(input.value, current, linktext);
@@ -88,15 +101,15 @@ export function attachNoteSuggest(app: App, input: HTMLTextAreaElement, host: HT
       row.id = `${list.id}-${i}`;
       row.setAttribute("role", "option");
       const name = doc.createElement("div"), path = doc.createElement("div");
-      name.className = "gloss-note-suggest-name"; name.textContent = file.basename;
-      path.className = "gloss-note-suggest-path"; path.textContent = file.path;
+      name.className = "gloss-note-suggest-name"; name.textContent = file.extension.toLowerCase() === "md" ? file.basename : file.name;
+      path.className = "gloss-note-suggest-path"; path.textContent = `${candidateKind(file)} · ${file.path}`;
       row.append(name, path);
       row.addEventListener("mousedown", event => event.preventDefault());
       row.addEventListener("mouseenter", () => highlight(i));
       row.addEventListener("click", event => { event.preventDefault(); choose(file); });
       list.appendChild(row);
     });
-    status.textContent = candidates.length ? `${candidates.length} 个候选 · ↑↓ 选择 · Enter / Tab 插入 · Esc 关闭` : "没有匹配的笔记，可继续输入或按 Esc 关闭";
+    status.textContent = candidates.length ? `${candidates.length} 个候选 · ↑↓ 选择 · Enter / Tab 插入 · Esc 关闭` : "没有匹配的文件，可继续输入或按 Esc 关闭";
     list.hidden = candidates.length === 0;
     panel.hidden = false;
     input.setAttribute("aria-expanded", "true");

@@ -1,6 +1,6 @@
 {
   "name": "obsidian-gloss",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Gloss — Word 风格页边批注 for Obsidian",
   "main": "main.js",
   "scripts": {

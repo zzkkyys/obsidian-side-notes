@@ -49,7 +49,7 @@ class Element extends Target {
   getBoundingClientRect() { return { left: 0, top: 0, right: 300, bottom: 100, width: 300, height: 100 }; }
 }
 class File {
-  constructor(filePath) { this.path = filePath; this.name = filePath.split('/').pop(); this.basename = this.name.replace(/\.md$/i, ''); this.extension = this.name.split('.').pop(); this.stat = { mtime: 1 }; }
+  constructor(filePath) { this.path = filePath; this.name = filePath.split('/').pop(); this.basename = this.name.replace(/\.[^.]+$/, ''); this.extension = this.name.split('.').pop(); this.stat = { mtime: 1 }; }
 }
 class Scope {
   constructor(parent) { this.parent = parent; this.bindings = []; }
@@ -76,13 +76,13 @@ function load(name, obsidian, cache = new Map()) {
 }
 function harness(paths = ['Alpha.md', 'Folder/Beta.md', 'Another/Beta.md']) {
   const files = paths.map(filePath => new File(filePath)), aliases = new Map();
-  const pushed = [], popped = [], resolved = [];
+  const pushed = [], popped = [], resolved = [], cacheReads = [];
   const app = {
     scope: new Scope(),
-    vault: { getMarkdownFiles: () => files.filter(file => file.extension === 'md'), getAbstractFileByPath: filePath => files.find(file => file.path === filePath) || null },
+    vault: { getFiles: () => files, getMarkdownFiles: () => files.filter(file => file.extension.toLowerCase() === 'md'), getAbstractFileByPath: filePath => files.find(file => file.path === filePath) || null },
     metadataCache: {
-      getFileCache: file => ({ frontmatter: { aliases: aliases.get(file.path) || [] } }),
-      fileToLinktext(file, sourcePath) { resolved.push({ file, sourcePath }); return file.path.replace(/\.md$/, ''); },
+      getFileCache(file) { cacheReads.push(file.path); return { frontmatter: { aliases: aliases.get(file.path) || [] } }; },
+      fileToLinktext(file, sourcePath, omitMdExtension) { resolved.push({ file, sourcePath, omitMdExtension }); return omitMdExtension ? file.path.replace(/\.md$/i, '') : file.path; },
     },
     keymap: { pushScope(scope) { pushed.push(scope); }, popScope(scope) { popped.push(scope); } },
   };
@@ -101,7 +101,7 @@ function harness(paths = ['Alpha.md', 'Folder/Beta.md', 'Another/Beta.md']) {
   const visible = element => !element.hidden && (!element.parentElement || visible(element.parentElement));
   const listbox = () => all(host).find(element => element.attrs.role === 'listbox' && visible(element));
   const options = () => all(host).filter(element => element.attrs.role === 'option');
-  return { ...exports, controller, app, files, aliases, doc, input, host, type, options, listbox, pushed, popped, resolved, OwnerEvent };
+  return { ...exports, controller, app, files, aliases, doc, input, host, type, options, listbox, pushed, popped, resolved, cacheReads, OwnerEvent };
 }
 
 test('note candidates match note names, paths, and aliases case-insensitively', () => {
@@ -114,7 +114,7 @@ test('note candidates match note names, paths, and aliases case-insensitively', 
   assert.deepEqual(paths('别名'), ['Other/Beta.md']);
   assert.deepEqual(paths('研究'), ['研究笔记.md']);
   assert.deepEqual(paths('missing'), []);
-  assert.ok(!paths('').includes('picture.png'));
+  assert.ok(paths('').includes('picture.png'));
   h.controller.dispose();
 });
 
@@ -240,7 +240,7 @@ test('mouse selection displays both duplicate paths and inserts the clicked note
   const h = harness(); h.type('[[Be');
   const rows = h.options();
   assert.equal(rows.length, 2);
-  const row = rows.find(element => element.children.some(child => child.textContent === 'Folder/Beta.md'));
+  const row = rows.find(element => element.children.some(child => child.textContent.includes('Folder/Beta.md')));
   assert.ok(row); assert.ok(row.children.some(child => child.textContent === 'Beta'));
   const down = key('mousedown', { type: 'mousedown' }); row.dispatchEvent(down);
   assert.equal(down.defaultPrevented, true);
@@ -266,4 +266,73 @@ test('Escape dismissal survives keyup and moving the caret outside a link closes
   h.input.dispatchEvent(key('ArrowLeft', { type: 'keyup' }));
   assert.equal(h.input.getAttribute('aria-expanded'), 'false');
   assert.equal(h.input.value, 'prefix [[Al'); h.controller.dispose();
+});
+
+test('candidates include supported image, PDF, and video extensions with case-insensitive filtering', () => {
+  const supported = ['md', 'avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'webp', 'pdf', 'mkv', 'mov', 'mp4', 'ogv', 'webm'];
+  const paths = supported.map((extension, index) => `Assets/file-${index}.${index % 2 ? extension.toUpperCase() : extension}`);
+  const excluded = ['data.json', 'archive.zip', 'audio.mp3', 'style.css', 'text.txt', 'README', 'fake.png.exe'];
+  const h = harness([...paths, ...excluded]);
+  h.aliases.set('Assets/file-1.AVIF', ['media alias must not match']);
+  const candidates = Array.from(h.findNoteCandidates(h.app, '', 50), file => file.path);
+  assert.deepEqual(candidates.sort(), paths.sort());
+  assert.deepEqual(Array.from(h.findNoteCandidates(h.app, 'media alias')), []);
+  assert.ok(h.cacheReads.length > 0);
+  assert.ok(h.cacheReads.every(filePath => /\.md$/i.test(filePath)), 'only Markdown files should have frontmatter aliases read');
+  h.controller.dispose();
+});
+
+test('extension searches prioritize exact filenames and support full paths', () => {
+  const h = harness(['report.pdf-extra.md', 'Archive/Report.PDF', 'Other.md', 'Archive/Report.png']);
+  h.aliases.set('Other.md', ['report.pdf']);
+  const paths = query => Array.from(h.findNoteCandidates(h.app, query), file => file.path);
+  assert.equal(paths('REPORT.PDF')[0], 'Archive/Report.PDF');
+  assert.ok(paths('REPORT.PDF').includes('report.pdf-extra.md'));
+  assert.deepEqual(paths('archive/report.p'), ['Archive/Report.PDF', 'Archive/Report.png']);
+  assert.deepEqual(paths('.png'), ['Archive/Report.png']);
+  h.controller.dispose();
+});
+
+test('same-basename notes and media show file type and select the exact clicked file', () => {
+  const formats = [['md', '笔记'], ['png', '图片'], ['pdf', 'PDF'], ['mp4', '视频']];
+  const paths = formats.map(([extension]) => `Attachments/asset.${extension}`);
+  for (const [extension, type] of formats) {
+    const h = harness(paths); h.type('[[asset');
+    const expectedPath = `Attachments/asset.${extension}`;
+    const row = h.options().find(element => element.children.some(child => child.textContent.includes(expectedPath)));
+    assert.ok(row, `missing ${extension} candidate`);
+    assert.ok(row.children.some(child => child.textContent === (extension === 'md' ? 'asset' : `asset.${extension}`)));
+    assert.ok(row.children.some(child => child.textContent.includes(type) && child.textContent.includes(expectedPath)));
+    row.dispatchEvent(key('click', { type: 'click' }));
+    assert.equal(h.input.value, `[[Attachments/asset${extension === 'md' ? '' : '.' + extension}]]`);
+    assert.equal(h.resolved[0].file.path, expectedPath);
+    assert.equal(h.resolved[0].sourcePath, 'Current/source.md');
+    assert.equal(h.resolved[0].omitMdExtension, true);
+    h.controller.dispose();
+  }
+});
+
+test('media completion preserves embed prefixes, image widths, PDF pages, and surrounding prose', () => {
+  const cases = [['png', '|320'], ['pdf', '#page=3'], ['mp4', '']];
+  for (const [extension, suffix] of cases) {
+    const h = harness([`Attachments/asset.${extension}`]);
+    const prefix = 'before ![[asset';
+    h.type(`${prefix}${suffix}]] after`, prefix.length);
+    assert.equal(press(h, 'Tab'), true);
+    assert.equal(h.input.value, `before ![[Attachments/asset.${extension}${suffix}]] after`);
+    assert.equal(h.input.selectionStart, h.input.value.indexOf(' after'));
+    assert.equal(h.input.selectionEnd, h.input.selectionStart);
+    h.controller.dispose();
+  }
+});
+
+test('media deleted after candidates appear cannot be inserted', () => {
+  const h = harness(['Attachments/asset.mp4']); h.type('![[asset');
+  assert.equal(h.options().length, 1);
+  h.files.splice(0);
+  press(h, 'Enter');
+  assert.equal(h.input.value, '![[asset');
+  assert.equal(h.resolved.length, 0);
+  assert.equal(h.listbox(), undefined);
+  h.controller.dispose();
 });
