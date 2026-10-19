@@ -91,6 +91,7 @@ function mainHarness() {
       name === './layout' ? { getSurface() { surfaces++; return null; } } : name === './card' ? { closeTypeMenu() {} } :
       name === './popover' ? { GlossBubble: { close() {} }, dismissCreatePopover(el) { dismissed++; el.remove(); } } : {} });
   const plugin = Object.create(Plugin.prototype);
+  plugin.editorHighlights = { clearUnder() {}, dispose() {}, layouts: [] };
   return { plugin, main, secondary, get surfaces() { return surfaces; }, get dismissed() { return dismissed; } };
 }
 test('connected Markdown view in another document reaches rendering', async () => {
@@ -123,13 +124,14 @@ test('save completion after unload does not reopen a bubble', async () => {
   assert.equal(revealed, false); assert.equal(h.secondary.body.children.length, 0);
 });
 
-test('margin card refresh is scheduled in its own window even if the main window is suspended', () => {
+for (const mode of ['reading', 'livepreview']) test(`${mode} card refresh uses its own window even if the main window is suspended`, () => {
   const h = mainHarness(), entry = { note: { id: 'a' } }, card = new El(h.secondary);
   let mainFrames = 0, secondaryFrames = 0;
   h.main.defaultView.requestAnimationFrame = () => { mainFrames++; };
   h.secondary.defaultView.requestAnimationFrame = () => { secondaryFrames++; };
-  Object.assign(h.plugin, { storage: { currentPath: () => 'a.md' }, editorHighlights: { refresh() {} }, pdf: null,
-    layoutMap: new Map([['secondary', { items: [{ entry, cardEl: card }] }]]) });
+  const layout = { items: [{ entry, cardEl: card }] };
+  Object.assign(h.plugin, { storage: { currentPath: () => 'a.md' }, editorHighlights: { refresh() {}, layouts: mode === 'livepreview' ? [layout] : [] }, pdf: null,
+    layoutMap: new Map(mode === 'reading' ? [['secondary', layout]] : []) });
   h.plugin.refreshCard(entry, { docPath: 'a.md' });
   assert.equal(mainFrames, 0); assert.equal(secondaryFrames, 1);
 });

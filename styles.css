@@ -64,6 +64,18 @@
   box-sizing: border-box;
 }
 
+/* CodeMirror owns .cm-content. Reserve margins on its outer text sizer so
+ * editing, selection and virtual line measurements remain intact. */
+.markdown-source-view.mod-cm6 .cm-sizer.gloss-gutter-padded {
+  padding-left: var(--gloss-gutter-pad);
+  padding-right: var(--gloss-gutter-pad);
+  box-sizing: border-box;
+}
+.markdown-source-view.mod-cm6.is-readable-line-width .cm-sizer.gloss-gutter-padded {
+  width: 100%;
+  max-width: calc(var(--file-line-width, 700px) + 2 * var(--gloss-gutter-pad));
+}
+
 /* 下划线模式：彩色虚线 + 浅底 */
 .gloss-hl-underline {
   background: rgba(59, 130, 246, 0.12);
@@ -99,6 +111,15 @@
 }
 .gloss-margin-layer {
   z-index: 5;
+}
+/* A sibling overlay clips cards to the editor viewport without contributing
+ * any height to CodeMirror's scrolling document. */
+.gloss-margin-viewport {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 5;
+  contain: layout paint;
 }
 .gloss-connectors {
   display: block;

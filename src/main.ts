@@ -2,7 +2,7 @@ import { migrateLegacyAttachments } from "./attachment-migration";
 import { MarkdownView, Menu, Modal, Notice, Plugin, TFile, TFolder, type EventRef } from "obsidian";
 import { applyCardStyle } from "./card-style";
 import { EditorHighlights, sourceRange } from "./editor";
-import { buildCard, closeTypeMenu, disposeCompsUnder, type CardHooks } from "./card";
+import { buildCard, closeTypeMenu, disposeCompsUnder } from "./card";
 import { exportDocAnnotations } from "./export";
 import { buildMarginLayout, getSurface, type MarginLayout } from "./layout";
 import { GENERIC_BLOCK_EDITOR, GENERIC_BLOCK_PREVIEW, unwrapAll, blockPlainText, locateAnchor, selectionToMdAnchor, wrapRangeInBlock } from "./anchor";
@@ -58,6 +58,8 @@ export default class GlossPlugin extends Plugin {
   private attachmentMigration: Promise<void> = Promise.resolve();
 
   get isAlive(): boolean { return this.alive; }
+
+  get marginLayoutMode() { return this.layoutOverride ?? this.settings.layoutMode; }
 
   // ================= 生命周期 =================
 
@@ -257,6 +259,7 @@ export default class GlossPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     this.alive = false;
+    this.editorHighlights.dispose();
     this.closeCreatePopover();
     closeTypeMenu();
     this.storage.onStatusChange = () => {};
@@ -286,7 +289,8 @@ export default class GlossPlugin extends Plugin {
       const v = leaf.view;
       if (!(v instanceof MarkdownView)) continue;
       const ce = v.contentEl;
-      unwrapAll(ce);
+      const preview = ce.querySelector<HTMLElement>(".markdown-preview-sizer");
+      if (preview) unwrapAll(preview);
       ce.querySelectorAll(".gloss-margin-layer").forEach(el => el.remove());
       // getSurface 的 host 候选（含回退到 contentEl 本身）
       for (const h of [
@@ -481,10 +485,6 @@ export default class GlossPlugin extends Plugin {
       previous?.surface.reset();
       previous?.surface.setGutter(null);
       this.layoutMap.delete(view.contentEl);
-      view.contentEl.querySelectorAll<HTMLElement>(".gloss-gutter-padded").forEach((el) => {
-        el.classList.remove("gloss-gutter-padded");
-        el.style.removeProperty("--gloss-gutter-pad");
-      });
       const store = await this.storage.loadDoc(file.path);
       if (!this.alive || view.file?.path !== file.path || this.renderSeq.get(view.contentEl) !== seq) return;
       this.editorHighlights.refresh(file.path);
@@ -494,6 +494,8 @@ export default class GlossPlugin extends Plugin {
       this.updateStatus();
       return;
     }
+
+    this.editorHighlights.clearUnder(view.contentEl);
 
     // 防自激回环：内容未变 + 无批注变更 + 1.5s 内 → 跳过
     if (!force) {
@@ -569,20 +571,10 @@ export default class GlossPlugin extends Plugin {
       // 无卡片不留白；即使偏好页边，也不能挤压正文，放不下时回退气泡。
       if ((placed.length > 0 || reuse) && want === "margin" && canMargin) {
         surface.setGutter(this.settings.marginWidth);
-        const hooks = (e: GlossEntry): CardHooks => ({
-          // 按 store 对象落盘：重命名后路径变了，但卡片修改的就是这个 store，
-          // 状态对象随之改挂新路径——旧路径的 saveDoc 会漏掉这批修改
-          onChanged: async (next, expected) => {
-            await this.storage.commitEntry(store, e.note.id, { ...e, note: next }, expected);
-            // 保存成功后只更新本卡，其他卡片的焦点、草稿和滚动位置保持不变。
-            this.refreshCard(e, store);
-          },
-          onDeleted: () => this.deleteAnnotation(store, e.note.id),
-        });
         if (reuse && prev) prev.updateAnchors(placed);
         else {
           const layout = buildMarginLayout(this, surface, placed, (e, t) =>
-            buildCard(this, e, t, file.path, hooks(e)));
+            this.buildMarginCard(e, t, store));
           this.layoutMap.set(view.contentEl, layout);
         }
       } else {
@@ -750,10 +742,21 @@ export default class GlossPlugin extends Plugin {
     this.touchVersion(path); this.refreshDoc(path);
   }
 
+  /** Shared card actions for reading and live-preview margins. */
+  buildMarginCard(entry: GlossEntry, type: GlossType, store: GlossDocStore): HTMLElement {
+    return buildCard(this, entry, type, this.storage.currentPath(store) ?? store.docPath, {
+      onChanged: async (next, expected) => {
+        await this.storage.commitEntry(store, entry.note.id, { ...entry, note: next }, expected);
+        this.refreshCard(entry, store);
+      },
+      onDeleted: () => this.deleteAnnotation(store, entry.note.id),
+    });
+  }
+
   refreshCard(entry: GlossEntry, store: GlossDocStore): void {
     const path = this.storage.currentPath(store) ?? store.docPath;
     this.editorHighlights.refresh(path); this.pdf?.refresh(path);
-    for (const layout of this.layoutMap.values()) for (const item of layout.items) {
+    for (const layout of [...this.layoutMap.values(), ...this.editorHighlights.layouts]) for (const item of layout.items) {
       if (item.entry !== entry || !item.cardEl) continue;
       const old = item.cardEl;
       const win = old.ownerDocument.defaultView;

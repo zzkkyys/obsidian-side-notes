@@ -23,13 +23,43 @@ export interface MarginSurface {
   setGutter: (w: number | null) => void;
   /** Align an external card layer with its text host. */
   syncLayer?: () => void;
-  /** 清空高亮与卡片层 */
+  /** 清空阅读高亮与卡片层；编辑器 DOM 仍由 CodeMirror 管理。 */
   reset: () => void;
+  /** 移除布局拥有的容器、滚动监听和页边留白。 */
+  dispose: () => void;
 }
 
 class SurfaceImpl implements MarginSurface {
   layer: HTMLElement;
   private layerParent: HTMLElement;
+  private viewport: HTMLElement | null = null;
+  private onScroll = () => this.syncLayer();
+  private onWheel = (event: WheelEvent) => {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey) return;
+    const win = this.host.ownerDocument.defaultView ?? window;
+    const css = win.getComputedStyle(this.host);
+    const lineHeight = parseFloat(css.lineHeight) || (parseFloat(css.fontSize) || 16) * 1.2;
+    const dx = event.deltaX * (event.deltaMode === 1 ? lineHeight : event.deltaMode === 2 ? this.host.clientWidth : 1);
+    const dy = event.deltaY * (event.deltaMode === 1 ? lineHeight : event.deltaMode === 2 ? this.host.clientHeight : 1);
+    const canScroll = (position: number, extent: number, viewport: number, delta: number) =>
+      delta < 0 ? position > 0 : delta > 0 && position < extent - viewport;
+    // Preserve native scrolling inside long cards, textareas and embedded media.
+    // Once an inner scroller reaches its edge, hand the gesture to the document.
+    const target = event.target as Node | null;
+    let el = target?.nodeType === 1 ? target as HTMLElement : target?.parentElement;
+    for (; el && el !== this.viewport; el = el.parentElement) {
+      const style = win.getComputedStyle(el);
+      if ((/^(auto|scroll|overlay)$/.test(style.overflowY) && canScroll(el.scrollTop, el.scrollHeight, el.clientHeight, dy))
+        || (/^(auto|scroll|overlay)$/.test(style.overflowX) && canScroll(el.scrollLeft, el.scrollWidth, el.clientWidth, dx))) return;
+    }
+    const top = Math.max(0, Math.min(this.host.scrollHeight - this.host.clientHeight, this.host.scrollTop + dy));
+    const left = Math.max(0, Math.min(this.host.scrollWidth - this.host.clientWidth, this.host.scrollLeft + dx));
+    if (top === this.host.scrollTop && left === this.host.scrollLeft) return;
+    event.preventDefault();
+    this.host.scrollTop = top;
+    this.host.scrollLeft = left;
+    this.syncLayer();
+  };
 
   constructor(
     public host: HTMLElement,
@@ -37,32 +67,51 @@ class SurfaceImpl implements MarginSurface {
     private scrollAdjusted: boolean,
   ) {
     host.classList.add("gloss-margin-host");
-    // Reading mode recycles the sizer's children during scrolling. Cards must be siblings,
-    // never children of that virtualized container (which also measures its child heights).
-    this.layerParent = !scrollAdjusted && host.parentElement ? host.parentElement : host;
+    // Both rendering engines virtualize their text container. Keep cards outside
+    // those containers; a clipped editor overlay must not affect scrollHeight.
+    this.layerParent = host.parentElement ?? host;
     this.layerParent.classList.add("gloss-layer-parent");
-    this.layerParent.querySelectorAll(":scope > .gloss-margin-layer").forEach(el => el.remove());
+    this.layerParent.querySelectorAll(":scope > .gloss-margin-layer, :scope > .gloss-margin-viewport").forEach(el => el.remove());
     host.querySelectorAll(":scope > .gloss-margin-layer").forEach(el => el.remove());
-    this.layer = this.layerParent.createDiv({ cls: "gloss-margin-layer" });
+    if (scrollAdjusted) {
+      this.viewport = this.layerParent.createDiv({ cls: "gloss-margin-viewport" });
+      host.addEventListener("scroll", this.onScroll, { passive: true });
+      this.viewport.addEventListener("wheel", this.onWheel, { passive: false });
+    }
+    this.layer = (this.viewport ?? this.layerParent).createDiv({ cls: "gloss-margin-layer" });
     this.layer.style.position = "absolute";
     this.layer.style.left = "0";
     this.layer.style.top = "0";
     this.layer.style.width = "100%";
+    this.layer.style.height = "0";
     this.layer.style.pointerEvents = "none";
-    // 预留空间的所有权随 class 走：每次新建 Surface 先清掉上一次残留
-    // （否则页边→气泡切换后，旧 padding 因新实例不认识 gutterPadded 而无法恢复）
     const g = this.gutterEl ?? this.host;
     g.classList.remove("gloss-gutter-padded");
     g.style.removeProperty("--gloss-gutter-pad");
+    this.syncLayer();
   }
 
   syncLayer(): void {
     if (this.layerParent === this.host) return;
     const host = this.host.getBoundingClientRect();
     const parent = this.layerParent.getBoundingClientRect();
-    this.layer.style.top = `${host.top - parent.top + this.layerParent.scrollTop - this.layerParent.clientTop}px`;
-    this.layer.style.left = `${host.left - parent.left + this.layerParent.scrollLeft - this.layerParent.clientLeft}px`;
-    this.layer.style.width = `${this.host.clientWidth}px`;
+    // Obsidian centers the readable text sizer within a wider scroller. The
+    // gutters belong to that sizer, so cards should align with its edges too.
+    const horizontal = this.scrollAdjusted ? this.gutterEl ?? this.host : this.host;
+    const bounds = horizontal.getBoundingClientRect();
+    const target = this.viewport ?? this.layer;
+    target.style.top = `${host.top - parent.top + this.layerParent.scrollTop - this.layerParent.clientTop}px`;
+    target.style.left = `${bounds.left - parent.left + this.layerParent.scrollLeft - this.layerParent.clientLeft}px`;
+    target.style.width = `${horizontal.clientWidth}px`;
+    if (this.viewport) {
+      this.viewport.style.height = `${this.host.clientHeight}px`;
+      // Horizontal scrolling moves the sizer and its overlay together, while
+      // this additional clip prevents cards from escaping the editor viewport.
+      const clipLeft = Math.max(0, host.left - bounds.left);
+      const clipRight = Math.max(0, bounds.left + horizontal.clientWidth - host.left - this.host.clientWidth);
+      this.viewport.style.clipPath = `inset(0 ${clipRight}px 0 ${clipLeft}px)`;
+      this.layer.style.transform = `translateY(${-this.host.scrollTop}px)`;
+    }
   }
 
   docTop(rect: DOMRect): number {
@@ -71,11 +120,11 @@ class SurfaceImpl implements MarginSurface {
   }
 
   hostLeft(): number {
-    return this.host.getBoundingClientRect().left;
+    return (this.scrollAdjusted ? this.gutterEl ?? this.host : this.host).getBoundingClientRect().left;
   }
 
   width(): number {
-    return this.host.clientWidth;
+    return (this.scrollAdjusted ? this.gutterEl ?? this.host : this.host).clientWidth;
   }
 
   availableWidth(): number {
@@ -85,14 +134,19 @@ class SurfaceImpl implements MarginSurface {
   }
 
   readingWidth(): number {
-    const content = this.gutterEl ?? this.host;
+    const content = this.scrollAdjusted
+      ? this.host.querySelector<HTMLElement>(".cm-content") ?? this.gutterEl ?? this.host
+      : this.gutterEl ?? this.host;
     const css = (content.ownerDocument.defaultView ?? window).getComputedStyle(content);
     const textWidth = content.clientWidth - (parseFloat(css.paddingLeft) || 0) - (parseFloat(css.paddingRight) || 0);
     return Math.max(480, Math.min(700, textWidth));
   }
 
   docHeight(): number {
-    return Math.max(this.host.scrollHeight, this.host.clientHeight) + 40;
+    // In the editor only the text sizer defines document height. The SVG and
+    // cards are decorative and must never increase the next measured height.
+    const content = this.scrollAdjusted ? this.gutterEl ?? this.host : this.host;
+    return Math.max(content.scrollHeight, content.clientHeight, this.host.clientHeight) + 40;
   }
 
   setGutter(w: number | null): void {
@@ -107,8 +161,18 @@ class SurfaceImpl implements MarginSurface {
   }
 
   reset(): void {
-    unwrapAll(this.host);
+    if (!this.scrollAdjusted) unwrapAll(this.host);
     this.layer.empty();
+  }
+
+  dispose(): void {
+    this.host.removeEventListener("scroll", this.onScroll);
+    this.viewport?.removeEventListener("wheel", this.onWheel);
+    this.setGutter(null);
+    this.host.classList.remove("gloss-margin-host");
+    this.layerParent.classList.remove("gloss-layer-parent");
+    this.layer.remove();
+    this.viewport?.remove();
   }
 }
 
@@ -120,8 +184,10 @@ export function getSurface(viewContentEl: HTMLElement, mode: "preview" | "livepr
     return new SurfaceImpl(sizer, sizer, false);
   }
   const scroller = viewContentEl.querySelector<HTMLElement>(".cm-scroller") ?? viewContentEl;
-  const cmContent = viewContentEl.querySelector<HTMLElement>(".cm-content") ?? null;
-  return new SurfaceImpl(scroller, cmContent, true);
+  const cmSizer = viewContentEl.querySelector<HTMLElement>(".cm-sizer") ?? null;
+  // Without the editor sizer there is no safe place to reserve card gutters.
+  if (!cmSizer || !scroller.parentElement) return null;
+  return new SurfaceImpl(scroller, cmSizer, true);
 }
 
 // ---------- 布局项与算法 ----------
@@ -145,8 +211,9 @@ export interface LayoutItem {
 export interface MarginLayout {
   items: LayoutItem[];
   surface: MarginSurface;
-  updateAnchors: (placed: Array<{ entry: GlossEntry; el: HTMLElement; type: GlossType }>) => void;
+  updateAnchors: (placed: Array<{ entry: GlossEntry; el: HTMLElement; type: GlossType }>, validIds?: ReadonlySet<string>) => void;
   observeCard: (card: HTMLElement, previous?: HTMLElement) => void;
+  refresh: () => void;
   dispose: () => void;
 }
 
@@ -291,9 +358,25 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
 
   return {
     observeCard,
+    refresh: apply,
     items,
     surface,
-    updateAnchors: (placed) => {
+    updateAnchors: (placed, validIds) => {
+      // A virtualized anchor remains valid while offscreen. Only an explicit
+      // full-document ID set can distinguish it from a deleted/unresolved note.
+      if (validIds) {
+        for (let index = items.length - 1; index >= 0; index--) {
+          const item = items[index];
+          if (validIds.has(item.entry.note.id)) continue;
+          if (item.cardEl) {
+            ro?.unobserve(item.cardEl);
+            io?.unobserve(item.cardEl);
+            disposeCompsUnder(item.cardEl);
+            item.cardEl.remove();
+          }
+          items.splice(index, 1);
+        }
+      }
       const visible = new Map(placed.map(p => [p.entry.note.id, p]));
       for (const it of items) {
         const p = visible.get(it.entry.note.id);
@@ -323,6 +406,7 @@ export function buildMarginLayout(plugin: GlossPlugin, surface: MarginSurface, p
       if (roTimer) clearTimeout(roTimer);
       for (const it of items) if (it.cardEl) disposeCompsUnder(it.cardEl);
       layer.remove();
+      surface.dispose?.();
     },
   };
 }

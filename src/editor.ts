@@ -1,8 +1,9 @@
+import { EditorMargin } from "./editor-margin";
 import { similarContext } from "./anchor-context";
 import { markerBackground } from "./highlight-style";
 import { StateEffect, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, type DecorationSet, type ViewUpdate } from "@codemirror/view";
-import { editorInfoField } from "obsidian";
+import { editorInfoField, editorLivePreviewField } from "obsidian";
 import type GlossPlugin from "./main";
 import type { MdAnchor } from "./types";
 import { GlossBubble } from "./popover";
@@ -84,6 +85,18 @@ export function sourceRange(text: string, anchor: MdAnchor, project = true): { f
 /** 由 CodeMirror 自己管理 span，编辑、虚拟滚动不会擦除或破坏其 DOM。 */
 export class EditorHighlights {
   private views = new Set<EditorView>();
+  private margins = new Map<EditorView, EditorMargin>();
+
+  get layouts() { return [...this.margins.values()].flatMap(margin => margin.layout ? [margin.layout] : []); }
+
+  clearUnder(host: HTMLElement): void {
+    for (const [view, margin] of this.margins) if (host.contains(view.dom)) margin.clear();
+  }
+
+  dispose(): void {
+    for (const margin of this.margins.values()) margin.destroy();
+    this.margins.clear();
+  }
   constructor(private plugin: GlossPlugin) {}
 
   extension(): Extension {
@@ -91,8 +104,11 @@ export class EditorHighlights {
     return ViewPlugin.fromClass(class {
       decorations: DecorationSet = Decoration.none;
       idle: ReturnType<typeof setTimeout> | null = null;
+      margin: EditorMargin;
       constructor(readonly view: EditorView) {
         owner.views.add(view);
+        this.margin = new EditorMargin(owner.plugin, view, () => this.decorations);
+        owner.margins.set(view, this.margin);
         this.rebuild();
         this.load();
       }
@@ -105,7 +121,7 @@ export class EditorHighlights {
       update(update: ViewUpdate): void {
         const oldPath = update.startState.field(editorInfoField, false)?.file?.path;
         const path = update.state.field(editorInfoField, false)?.file?.path;
-        if (oldPath !== path) this.load();
+        if (oldPath !== path) { this.margin.clear(); this.load(); }
         if (oldPath !== path || update.transactions.some(t => t.effects.some(e => e.is(refresh)))) {
           if (this.idle) clearTimeout(this.idle);
           this.idle = null;
@@ -118,7 +134,10 @@ export class EditorHighlights {
             if (owner.views.has(this.view) && owner.plugin.isAlive) this.view.dispatch({ effects: refresh.of(null) });
           }, 400);
         }
+        if (update.docChanged || update.viewportChanged || update.geometryChanged
+          || update.startState.field(editorLivePreviewField, false) !== update.state.field(editorLivePreviewField, false)) this.margin.schedule();
       }
+      docViewUpdate(): void { this.margin.schedule(); }
       rebuild(): void {
         const path = this.view.state.field(editorInfoField, false)?.file?.path;
         const store = path ? owner.plugin.storage.docCacheFor(path) : undefined;
@@ -136,8 +155,14 @@ export class EditorHighlights {
           }).range(range.from, range.to));
         }
         this.decorations = Decoration.set(marks, true);
+        this.margin.schedule();
       }
-      destroy(): void { if (this.idle) clearTimeout(this.idle); owner.views.delete(this.view); }
+      destroy(): void {
+        if (this.idle) clearTimeout(this.idle);
+        this.margin.destroy();
+        owner.margins.delete(this.view);
+        owner.views.delete(this.view);
+      }
     }, {
       decorations: instance => instance.decorations,
       eventHandlers: {
